@@ -27,15 +27,25 @@ usable as more than that.)*
       weight decay, no LR schedule, no gradient clipping. Attention/feed-forward weights
       still have no gradient signal at all (see "Add proper momentum / optimizer for
       expert parameters" below, which this generalizes).
-- [ ] Checkpoint resume (depends on serialization below)
+- [x] ~~Checkpoint resume (depends on serialization below)~~ -- done: `checkpoint.load_checkpoint()` reconstructs a fully-trained `FractalBrain` and `persistence_demo.py` demonstrates continuing training on it (verified bit-for-bit identical to an uninterrupted run, across two separate processes -- see CHANGELOG). A full optimizer with momentum/schedule/decay is still the open part, per the item above.
 
 ### Persistence
-- [ ] The RAG `VectorStore` is in-memory, brute-force, and vanishes on process exit --
-      fine for demos, not a durable knowledge base. Needs disk persistence and a real
-      index structure to scale past a toy corpus. (Also recall it's not currently wired
-      into the gate/logits at all yet -- see "Known gaps" below.)
-- [ ] Model serialization: save/load weights, vocabulary, training state (PID gains,
-      lasso mask, step count), and retrieval memory, ideally as versioned checkpoints.
+- [x] ~~Storage schema~~ -- done: `storage.Storage`, a thin SQLite wrapper implementing exactly the schema suggested below (vocab, samples, documents, checkpoints, metrics, plus a generic memory table)
+- [ ] The RAG `VectorStore` is in-memory and brute-force by default -- `Storage` can now
+      persist and reload its documents (`save_document`/`load_documents`/
+      `load_into_vector_store`), but `VectorStore` itself still has no built-in index
+      structure, so search stays brute-force even when the vectors are loaded from disk.
+      Fine for a toy corpus, not for scaling past one. (Also recall it's not currently
+      wired into the gate/logits at all yet -- see "Known gaps" below.)
+- [x] ~~Model serialization: save/load weights, vocabulary, training state, retrieval memory~~
+      -- weights + training state done: `checkpoint.save_checkpoint`/`load_checkpoint`
+      (every weight matrix, PID gains *and* internal state, markov chain state,
+      step_count, lasso mask, RAG vector store contents -- verified bit-for-bit across
+      two separate processes, see CHANGELOG). Vocabulary save/load was already covered
+      by `BPETokenizer.save`/`.load`; `Storage.save_vocab`/`load_vocab` adds a queryable
+      copy. Versioned checkpoints: done via `Storage.save_checkpoint_blob`/
+      `list_checkpoints`. Not saved: `FractalBrain.teacher` (arbitrary externally-injected
+      object, no generally-correct way to reconstruct -- documented in CHANGELOG).
 
 ### Scale
 - [ ] Pure Python / nested lists throughout -- fine for learning and experimentation (see
@@ -59,11 +69,14 @@ usable as more than that.)*
 ### Suggested build order (if pursuing the above)
 1. ~~Tokenizer~~ -- done
 2. ~~Dataset loader~~ -- done
-3. Storage schema (SQLite or the JSONL alternative)
-4. Checkpoint save/load
+3. ~~Storage schema~~ -- done: `storage.Storage` (SQLite)
+4. ~~Checkpoint save/load~~ -- done: `checkpoint.py`
 5. A proper optimizer
 6. Batching
-7. Retrieval persistence
+7. Retrieval persistence -- **partially done**: `Storage.save_document`/`load_documents`/
+   `load_into_vector_store` persist and reload a `VectorStore`'s contents; it's still
+   brute-force search once loaded (no index structure), and still not wired into the
+   gate/logits (see "Known gaps").
 8. Evaluation loop -- **partially done**: `FractalBrain.evaluate()` is the core read-only
    primitive (forward pass + loss, no weight updates); a fuller harness (aggregate
    metrics across a dataset, perplexity, etc.) is still open. See `train_on_text.py` for
@@ -93,11 +106,14 @@ usable as more than that.)*
 - [x] Gradient descent for each expert's output projection (`W_out`), via the exact softmax-cross-entropy gradient (CHANGELOG #22)
 - [x] Real meta-gradient descent for the PID gains, via cheap finite differences (CHANGELOG #9, #23)
 - [x] Adaptive temperature in softmax based on PID (previously listed under Medium-Term; this is what the PID gains now actually control -- CHANGELOG #7)
-- [x] Unit tests for each module (`tests/test_smoke.py`, 67 checks)
+- [x] Unit tests for each module (`tests/test_smoke.py`, 95 checks)
 - [x] BPE tokenizer with train/encode/decode/save/load (`tokenizer.BPETokenizer`)
 - [x] Text dataset with sliding-window examples and train/val/test split (`dataset.TextDataset`)
 - [x] Read-only `evaluate()` for validation/test metrics without training on them (`core.FractalBrain.evaluate()`)
 - [x] End-to-end real-text training example (`train_on_text.py`)
+- [x] Full model checkpointing -- weights, PID state, markov chain state, RAG store, everything (`checkpoint.py`), verified bit-for-bit reproducible across separate processes
+- [x] SQLite-backed persistence for vocab, samples, RAG documents, checkpoints, and metrics (`storage.py`)
+- [x] End-to-end persistence example (`persistence_demo.py`)
 
 ## Known gaps (found while fixing the above -- flagging rather than silently leaving)
 - [ ] JEPA's own encoder/predictor weights are never trained: the loss is computed and
@@ -148,7 +164,7 @@ usable as more than that.)*
 - [ ] Compile critical parts to C extensions (optional) -- the single biggest pure-Python
       hot loop was the bootstrap-gate resampling (CHANGELOG #20, now ~5x cheaper by
       default, but still the natural first target if you profile a real run)
-- [ ] Export trained meta‑parameters (PID gains, lasso masks) as a compact config
+- [x] ~~Export trained meta‑parameters (PID gains, lasso masks) as a compact config~~ -- superseded: `checkpoint.py` saves these (and everything else) as part of a full checkpoint rather than a separate config export; see `Storage.save_checkpoint_blob` for a compact, named/versioned way to keep several.
 - [ ] Interface with external LLMs as "teachers" for distillation (the teacher interface
       is just `.forward(token_ids) -> Matrix(seq_len, vocab_size)`, so any wrapper around
       an external model implementing that method should slot in directly)

@@ -27,6 +27,11 @@ from .signal import DelayLine, convolve1d
 from .distillation import distillation_loss
 from .tokenizer import BPETokenizer, normalize_text
 from .dataset import TextDataset, DatasetView
+from .checkpoint import (
+    save_checkpoint, load_checkpoint, serialize_brain, deserialize_brain,
+    register_checkpoint_class,
+)
+from .storage import Storage
 
 __all__ = [
     # math_utils
@@ -70,4 +75,9 @@ __all__ = [
     "BPETokenizer", "normalize_text",
     # dataset
     "TextDataset", "DatasetView",
+    # checkpoint
+    "save_checkpoint", "load_checkpoint", "serialize_brain", "deserialize_brain",
+    "register_checkpoint_class",
+    # storage
+    "Storage",
 ]

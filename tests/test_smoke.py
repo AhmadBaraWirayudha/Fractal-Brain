@@ -16,6 +16,9 @@ import math
 import random
 import sys
 import os
+import json
+import tempfile
+import warnings
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -26,6 +29,8 @@ from fractal_brain import (
     VectorStore, StateRAGFusion, BCMPlasticity, TurboQuant, PCA, Wormhole,
     LogicFolder, fuzzy_and, fuzzy_or, fuzzy_not, FractalMatrix, JEPA, Value,
     DelayLine, distillation_loss, BPETokenizer, TextDataset,
+    save_checkpoint, load_checkpoint, serialize_brain, deserialize_brain,
+    register_checkpoint_class, Storage,
 )
 
 PASSED = []
@@ -426,6 +431,155 @@ before_w2 = _w_out_snapshot(brain4)
 brain4.step(toks_e, tgt_e)
 after_w2 = _w_out_snapshot(brain4)
 check("step() (unlike evaluate()) does change W_out -- confirms evaluate() isn't just a no-op forward", before_w2 != after_w2)
+
+
+# ============================================================================
+section("checkpoint: save/load round-trip and edge cases")
+# ============================================================================
+_tmpdir = tempfile.mkdtemp(prefix="fractal_brain_test_")
+
+set_seed(21)
+ckpt_brain = FractalBrain(vocab_size=25, d_model=12, num_experts=3, num_heads=2, d_ff=24,
+                          num_layers=1, num_markov_nodes=3, markov_states=3, max_level=2,
+                          use_jepa=True, use_wormhole=True)
+for _ in range(15):
+    ckpt_brain.step([1, 2, 3], [1.0 if i == 5 else 0.0 for i in range(25)])
+
+ckpt_path = os.path.join(_tmpdir, "brain.json")
+save_checkpoint(ckpt_brain, ckpt_path)
+reloaded_brain = load_checkpoint(ckpt_path)
+
+check("checkpoint round-trips expert W_out weights",
+      reloaded_brain.moe.experts[0].W_out.data == ckpt_brain.moe.experts[0].W_out.data)
+check("checkpoint round-trips PID gains",
+      (reloaded_brain.pid.Kp, reloaded_brain.pid.Ki, reloaded_brain.pid.Kd) ==
+      (ckpt_brain.pid.Kp, ckpt_brain.pid.Ki, ckpt_brain.pid.Kd))
+check("checkpoint round-trips step_count", reloaded_brain.step_count == ckpt_brain.step_count)
+check("checkpoint round-trips markov chain state",
+      reloaded_brain.current_markov_states == ckpt_brain.current_markov_states)
+check("checkpoint round-trips wormhole weights",
+      reloaded_brain.wormhole.W.data == ckpt_brain.wormhole.W.data)
+check("checkpoint round-trips jepa weights",
+      reloaded_brain.jepa.Wc.data == ckpt_brain.jepa.Wc.data)
+check("checkpoint round-trips rag_index vectors",
+      [v.to_list() for v in reloaded_brain.rag_index.vectors] ==
+      [v.to_list() for v in ckpt_brain.rag_index.vectors])
+
+# teacher: excluded, with a warning
+class _DummyTeacherForTest:
+    def forward(self, token_ids):
+        return Matrix([[0.1] * 25 for _ in token_ids])
+
+ckpt_brain.teacher = _DummyTeacherForTest()
+with warnings.catch_warnings(record=True) as caught:
+    warnings.simplefilter("always")
+    save_checkpoint(ckpt_brain, ckpt_path)
+check("save_checkpoint warns when a teacher is attached",
+      any("teacher" in str(w.message) for w in caught))
+check("original brain's teacher is restored (not left None) after saving",
+      ckpt_brain.teacher is not None)
+reloaded_with_teacher = load_checkpoint(ckpt_path)
+check("teacher comes back as None after reload", reloaded_with_teacher.teacher is None)
+ckpt_brain.teacher = None
+
+# restore_rng_state flag -- deliberately scramble the global RNG first so the
+# before/after comparison is airtight regardless of what any earlier test did to it
+save_checkpoint(ckpt_brain, ckpt_path)
+rng_at_save_time = random.getstate()
+random.seed(123456)
+check("sanity check: scrambling the seed actually changed the global state",
+      random.getstate() != rng_at_save_time)
+load_checkpoint(ckpt_path, restore_rng_state=False)
+check("restore_rng_state=False leaves the (scrambled) global random state untouched",
+      random.getstate() != rng_at_save_time)
+load_checkpoint(ckpt_path, restore_rng_state=True)
+check("restore_rng_state=True restores the exact saved global random state",
+      random.getstate() == rng_at_save_time)
+
+# unregistered class fails loudly, not silently
+class _UnregisteredForTest:
+    def __init__(self):
+        self.x = 1
+
+ckpt_brain._unregistered_attr = _UnregisteredForTest()
+try:
+    save_checkpoint(ckpt_brain, ckpt_path)
+    check("checkpointing an unregistered class raises TypeError", False, "did not raise")
+except TypeError:
+    check("checkpointing an unregistered class raises TypeError", True)
+register_checkpoint_class(_UnregisteredForTest)
+save_checkpoint(ckpt_brain, ckpt_path)
+reloaded_custom = load_checkpoint(ckpt_path)
+check("registering a class allows it to round-trip", reloaded_custom._unregistered_attr.x == 1)
+del ckpt_brain._unregistered_attr
+
+# None-components (use_jepa=False, use_wormhole=False) round-trip too
+set_seed(22)
+none_brain = FractalBrain(vocab_size=15, d_model=8, num_experts=2, num_heads=2, d_ff=16,
+                          num_layers=1, num_markov_nodes=2, markov_states=3, max_level=1,
+                          use_jepa=False, use_wormhole=False)
+none_brain.step([1, 2], [0.0] * 15)
+none_path = os.path.join(_tmpdir, "none_brain.json")
+save_checkpoint(none_brain, none_path)
+reloaded_none_brain = load_checkpoint(none_path)
+check("checkpoint round-trips None wormhole/jepa",
+      reloaded_none_brain.wormhole is None and reloaded_none_brain.jepa is None)
+
+
+# ============================================================================
+section("storage.Storage (SQLite persistence)")
+# ============================================================================
+db_path = os.path.join(_tmpdir, "test.db")
+db_corpus = ["the quick brown fox", "the lazy dog sleeps", "a quick fox runs"]
+db_tok = BPETokenizer(lowercase=True)
+db_tok.train(db_corpus, vocab_size=60)
+db_dataset = TextDataset(db_tok, db_corpus, context_length=3)
+db_train, db_val, _db_test = db_dataset.split(train_frac=0.7, val_frac=0.15, seed=0)
+
+with Storage(db_path) as db:
+    db.save_vocab(db_tok)
+    check("Storage vocab round-trips", db.load_vocab() == db_tok.token_to_id)
+
+    db.save_samples(db_train, split="train")
+    check("Storage sample count matches", db.count_samples("train") == len(db_train))
+    restored_samples = list(db.iter_samples(split="train"))
+    original_samples = [(list(c), list(t)) for c, t in db_train]
+    check("Storage samples round-trip exactly", restored_samples == original_samples)
+
+    doc_vecs = [Vector([float(i), float(i) * 2, 0.5]) for i in range(4)]
+    for v in doc_vecs:
+        db.save_document(v, source="test")
+    loaded_docs = db.load_documents()
+    check("Storage documents round-trip", [d[3] for d in loaded_docs] == [v.to_list() for v in doc_vecs])
+
+    vs_for_test = VectorStore(dim=3)
+    db.load_into_vector_store(vs_for_test)
+    check("Storage.load_into_vector_store populates a VectorStore", len(vs_for_test.vectors) == 4)
+
+    blob = json.dumps(serialize_brain(none_brain)).encode("utf-8")
+    db.save_checkpoint_blob("v1", blob, config={"note": "test"})
+    blob2, config2 = db.load_checkpoint_blob("v1")
+    check("Storage checkpoint blob round-trips config", config2 == {"note": "test"})
+    reloaded_from_db = deserialize_brain(json.loads(blob2.decode("utf-8")))
+    check("Storage checkpoint blob round-trips weights",
+          reloaded_from_db.moe.W_gate.data == none_brain.moe.W_gate.data)
+    try:
+        db.load_checkpoint_blob("does-not-exist")
+        check("Storage.load_checkpoint_blob raises KeyError for missing version", False, "did not raise")
+    except KeyError:
+        check("Storage.load_checkpoint_blob raises KeyError for missing version", True)
+
+    for step in range(3):
+        db.log_metric(step, loss=1.0 / (step + 1))
+    check("Storage metrics round-trip", [m[0] for m in db.load_metrics()] == [0, 1, 2])
+
+    db.set_memory("cfg", {"lr": 0.01})
+    check("Storage memory round-trips a dict", db.get_memory("cfg") == {"lr": 0.01})
+    check("Storage memory default for missing key", db.get_memory("nope", default="x") == "x")
+
+# data survives closing and reopening the connection
+with Storage(db_path) as db2:
+    check("Storage data survives reopen", db2.count_samples("train") == len(db_train))
 
 
 # ============================================================================

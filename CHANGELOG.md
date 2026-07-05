@@ -1,5 +1,72 @@
 # Changelog
 
+## Persistence: checkpointing and SQLite-backed storage (new capability)
+
+This is new capability, not a bug fix -- covering the "Storage schema" and "Checkpoint
+save/load" items from `To-Do.md` (items 3-4 of its suggested build order), and the
+weights/training-state half of "Model serialization".
+
+- **`checkpoint.py`**: save/load a full `FractalBrain` -- every weight matrix, the PID
+  controller's gains *and* internal integral/derivative state, the fractal Markov
+  chain's current states, the lasso mask, `step_count`, the RAG vector store's contents,
+  the embedding delay line's buffer, everything -- to/from JSON, with no external
+  dependencies. Rather than hand-writing a bespoke serializer for each of the ~15
+  classes involved (a large surface that would drift out of sync the moment any of them
+  gained, lost, or renamed an attribute), it walks the object graph generically:
+  `Matrix`/`Vector` are special-cased, plain values and containers recurse, and any
+  other object is reconstructed via `object.__new__(cls)` + restoring `__dict__`
+  directly (bypassing `__init__` entirely) -- safe here because none of this project's
+  classes do anything in `__init__` beyond building sub-objects and assigning
+  attributes, which I confirmed by reading every `__init__` rather than assuming it.
+  Unregistered custom classes raise a clear `TypeError` rather than failing silently or
+  corrupting the save.
+
+  Verified two ways. First, the obvious way: save, reload into a fresh instance, and
+  check every weight/PID-gain/counter matches (it does). Second, the way that actually
+  matters: does resuming training after a reload reproduce what an *uninterrupted* run
+  would have done, bit-for-bit? This requires capturing Python's *global* `random`
+  module state too, not just the brain's own attributes -- `BootstrapGate` (the fractal
+  Markov chain's novelty gate) draws from it directly rather than from a per-instance
+  RNG, which I only discovered by writing this test and watching a naive version of it
+  fail. With that fixed, I ran two genuinely separate OS processes (not just two Python
+  objects in one process, which would share that same global state unfairly) -- one
+  training straight through, one saving a checkpoint partway and reloading it in a fresh
+  process to continue -- and diffed the resulting losses: identical, all 40
+  post-checkpoint steps, to the last floating-point digit.
+
+  `FractalBrain.teacher` is deliberately *not* saved: it's an arbitrary,
+  externally-injected object (e.g. `orchestrator.FrozenTeacherExpert` isn't even part of
+  this package), so there's no generally-correct way to reconstruct it.
+  `save_checkpoint()` warns if one is attached; reattach it manually after loading.
+
+- **`storage.py`**: a thin SQLite wrapper (`sqlite3` is standard library, so this
+  doesn't compromise the zero-dependency design) implementing the exact schema
+  suggested in `To-Do.md`: `vocab`, `samples`, `documents` (RAG persistence, embeddings
+  as BLOB), `checkpoints` (versioned blobs, e.g. from `checkpoint.serialize_brain`), and
+  `metrics`. Also includes a generic `memory` key-value table for anything else (config,
+  experiment notes) that didn't need its own table.
+
+- **`persistence_demo.py`**: a new end-to-end example -- train a tokenizer and dataset,
+  persist both to SQLite, train while logging metrics and periodically checkpointing
+  (both as a standalone file and as versioned blobs inside the same database), reload a
+  standalone checkpoint into a fresh instance and continue training, and pull a specific
+  earlier checkpoint back out of the database by name.
+
+  One thing this script's first draft got wrong, worth recording: it originally compared
+  `original_brain.sample(...)` against `reloaded_brain.sample(...)` right after loading
+  and reported them as different, which -- read carelessly -- looks like a checkpoint
+  bug. It isn't one: both calls draw on that same shared global random state mentioned
+  above, and calling one first advances the shared state before the other runs. Two live
+  `FractalBrain` instances in one process are simply not independent that way, with or
+  without checkpointing involved. The demo now compares static attributes (weights, PID
+  gains) instead, which is the fair comparison, and says so in a comment; the stochastic
+  part is what the two-separate-processes test above actually verifies.
+
+Verified: 28 new checks in `tests/test_smoke.py` (95 total, all passing), plus the
+cross-process checkpoint-fidelity test described above (not itself part of the unit
+test suite, since it needs two separate process invocations to be a fair test -- see
+this section).
+
 ## Data pipeline: tokenizer, dataset, and a read-only `evaluate()` (new capability)
 
 This is new capability, not a bug fix -- covering the "Tokenizer", "Vocabulary

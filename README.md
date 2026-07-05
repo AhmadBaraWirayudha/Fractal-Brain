@@ -29,10 +29,13 @@ your_project/
     core.py
     tokenizer.py         <- BPE tokenizer
     dataset.py           <- next-token-prediction dataset + train/val/test split
+    checkpoint.py         <- save/load a full FractalBrain (weights + training state)
+    storage.py            <- SQLite persistence (vocab, samples, documents, checkpoints, metrics)
     ...
   how_to_use.py           <- minimal single-step example
   orchestrator.py         <- fuller training-loop example (synthetic data, distillation, TurboQuant, PCA)
   train_on_text.py        <- tokenizer -> dataset -> train/val split -> training -> generation
+  persistence_demo.py      <- SQLite storage + checkpoint save/load, end to end
   tests/
     test_smoke.py         <- regression test suite (python tests/test_smoke.py)
 ```
@@ -65,12 +68,22 @@ probs = brain.sample([12, 45], temperature=0.7)
 
 See `how_to_use.py` for a runnable version of this, `orchestrator.py` for a full
 training loop on synthetic data (distillation against a frozen teacher, periodic
-`TurboQuant` compression stats and `PCA` inspection of the embedding table), and
+`TurboQuant` compression stats and `PCA` inspection of the embedding table),
 `train_on_text.py` for the full data pipeline on real text: a from-scratch BPE
 tokenizer (`tokenizer.BPETokenizer`), a next-token-prediction dataset with a proper
 train/val/test split (`dataset.TextDataset`), and validation via `FractalBrain.evaluate()`
 (a read-only counterpart to `step()` -- calling `step()` itself on held-out data would
-silently train on it).
+silently train on it), and `persistence_demo.py` for saving/reloading a trained model
+and querying training history back out of a SQLite database:
+
+```python
+from fractal_brain.checkpoint import save_checkpoint, load_checkpoint
+
+save_checkpoint(brain, "model.json")
+brain2 = load_checkpoint("model.json")   # every weight, PID state, markov chain
+                                          # state, RAG store, etc. -- ready to keep
+                                          # training or to sample from
+```
 
 ## A note on performance
 
@@ -88,7 +101,7 @@ path to real speed (compiling the hot loops as C extensions).
 python tests/test_smoke.py
 ```
 
-Runs a dependency-free suite of 67 checks covering every module, including regression
+Runs a dependency-free suite of 95 checks covering every module, including regression
 tests for each bug listed in `CHANGELOG.md`.
 
 ## Status
