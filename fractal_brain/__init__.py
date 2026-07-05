@@ -25,6 +25,8 @@ from .jepa import JEPA
 from .autograd import Value
 from .signal import DelayLine, convolve1d
 from .distillation import distillation_loss
+from .tokenizer import BPETokenizer, normalize_text
+from .dataset import TextDataset, DatasetView
 
 __all__ = [
     # math_utils
@@ -63,5 +65,9 @@ __all__ = [
     # signal
     "DelayLine", "convolve1d",
     # distillation
-    "distillation_loss"
+    "distillation_loss",
+    # tokenizer
+    "BPETokenizer", "normalize_text",
+    # dataset
+    "TextDataset", "DatasetView",
 ]

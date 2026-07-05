@@ -254,24 +254,15 @@ class FractalBrain:
             grad = (loss_for_correction(corr_plus) - loss_for_correction(corr_minus)) / (2 * delta)
             setattr(self.pid, gain, max(0.0, base_val - meta_lr * grad))
 
-    def step(self, token_ids, target_distribution):
+    def _compute_losses(self, logits, token_ids, target_distribution):
         """
-        One training/inference step:
-        - Forward pass with current PID correction
-        - Compute loss (CE + KL + lasso + jepa + distillation)
-        - Train each expert's output projection, meta-update PID gains, apply BCM
-          plasticity, and periodically prune tentacles
-        Returns logits, total_loss.
+        Pure/read-only: computes every loss term from an already-computed forward pass.
+        Shared by step() (which additionally applies learning updates) and evaluate()
+        (which doesn't), so the two can never drift apart on what "the loss" means.
+        Returns (has_target, ce_loss, kl, probs, l1, jepa_loss, distill_loss, total_loss).
+        `probs` is None when there's no target to compare against.
         """
-        if not hasattr(self, '_pid_error'):
-            self._pid_error = 0.0
-        pid_correction = self.pid.step(self._pid_error)
-
-        logits, expert_weights, expert_outputs = self.forward(token_ids, pid_correction)
-        seq_len = len(token_ids)
         has_target = bool(token_ids) and bool(target_distribution)
-
-        # ----- Losses -----
         ce_loss = 0.0
         kl = 0.0
         probs = None
@@ -283,16 +274,10 @@ class FractalBrain:
                     ce_loss += -t * math.log(max(probs[i], 1e-12))
             kl = kl_divergence(Vector([math.log(max(p, 1e-12)) for p in probs.data]),
                                 Vector(target_distribution))
-        # store error for next PID step
-        self._pid_error = kl
 
-        # Lasso penalty
         l1 = self.tentacles.l1_loss()
-
-        # JEPA auxiliary loss
         jepa_loss = self._last_jepa_loss
 
-        # Distillation loss (if teacher is given)
         distill_loss = 0.0
         if self.teacher and token_ids:
             teacher_logits = self.teacher.forward(token_ids)   # assume Matrix (seq_len, vocab)
@@ -303,6 +288,31 @@ class FractalBrain:
                                                  true_labels=Vector(target_distribution) if target_distribution else None)
 
         total_loss = ce_loss + 0.01 * l1 + 0.1 * jepa_loss + 0.1 * distill_loss
+        return has_target, ce_loss, kl, probs, l1, jepa_loss, distill_loss, total_loss
+
+    def step(self, token_ids, target_distribution):
+        """
+        One training/inference step:
+        - Forward pass with current PID correction
+        - Compute loss (CE + KL + lasso + jepa + distillation)
+        - Train each expert's output projection, meta-update PID gains, apply BCM
+          plasticity, and periodically prune tentacles
+        Returns logits, total_loss.
+
+        For a read-only pass that computes the same loss without updating any weights
+        (e.g. for validation/test metrics), use evaluate() instead.
+        """
+        if not hasattr(self, '_pid_error'):
+            self._pid_error = 0.0
+        pid_correction = self.pid.step(self._pid_error)
+
+        logits, expert_weights, expert_outputs = self.forward(token_ids, pid_correction)
+        seq_len = len(token_ids)
+
+        has_target, ce_loss, kl, probs, l1, jepa_loss, distill_loss, total_loss = \
+            self._compute_losses(logits, token_ids, target_distribution)
+        # store error for next PID step
+        self._pid_error = kl
 
         # ----- Train each expert's output projection (real gradient descent) -----
         if has_target:
@@ -326,6 +336,30 @@ class FractalBrain:
         if self.step_count % 50 == 0:
             self.tentacles.prune()
 
+        return logits, total_loss
+
+    def evaluate(self, token_ids, target_distribution=None):
+        """
+        Read-only counterpart to step(): the same forward pass and total_loss, but never
+        updates any weights (expert output projections, PID gains, tentacles, gate) and
+        never advances step_count/pruning. Use this for validation/test metrics --
+        calling step() on held-out data would silently train on it, since step() has no
+        "no-op" mode of its own.
+
+        Two things this does *not* freeze, deliberately: it still advances the fractal
+        Markov chain's internal state and the embedding delay line, exactly like step()
+        does. Those are the model's ongoing internal dynamics (closer to an RNN's hidden
+        state than to a trainable parameter) rather than something being *fit* to
+        whatever you evaluate on, so letting them continue seemed more correct than
+        freezing them -- but it does mean calling evaluate() interleaved with step() can
+        affect subsequent calls either way, the same as calling step() itself repeatedly
+        would. It also does not mutate the PID controller's integral/prev_error: it
+        *peeks* at the correction the controller's current gains would produce via
+        compute_output(), rather than calling step() on it.
+        """
+        pid_correction = self.pid.compute_output()
+        logits, expert_weights, expert_outputs = self.forward(token_ids, pid_correction)
+        _, _, _, _, _, _, _, total_loss = self._compute_losses(logits, token_ids, target_distribution)
         return logits, total_loss
 
     def sample(self, token_ids, temperature=1.0):

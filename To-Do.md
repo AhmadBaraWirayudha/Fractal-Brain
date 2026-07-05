@@ -3,6 +3,73 @@
 > See `CHANGELOG.md` for the full list of bugs fixed and why. This file tracks what's
 > left, not what changed.
 
+## Beyond the architecture: data, training & productionization infrastructure
+
+*(Added from a separate infrastructure review, folded in here rather than kept as a
+one-off note. The short version: this project is a prototype hybrid architecture that
+operates on already-tokenized `list[int]` / `list[float]` input and in-memory state --
+solid and now-working as that, but missing everything around it that would make it
+usable as more than that.)*
+
+### Data pipeline
+- [x] ~~Tokenizer~~ -- done: `tokenizer.BPETokenizer`, a real from-scratch BPE tokenizer (train/encode/decode/save/load)
+- [x] ~~Vocabulary builder~~ -- done: built into `BPETokenizer.train()` (learns the vocab + merges together, same as most real tokenizer libraries)
+- [x] ~~Dataset loader (from raw text)~~ -- done: `dataset.TextDataset`
+- [x] ~~Text cleaning / normalization~~ -- done: `tokenizer.normalize_text()` (lowercasing, whitespace collapsing)
+- [x] ~~Train / validation / test split~~ -- done: `TextDataset.split()`
+- [ ] Batching and padding -- `FractalBrain.step()` currently takes one sequence at a time
+
+### Training completeness
+- [ ] A real, general-purpose optimizer. To be precise about where things actually stand
+      (see CHANGELOG #22, #23): there *is* now a real per-step gradient update on the
+      output projections and the PID gains, but it's plain fixed-learning-rate gradient
+      descent, not an optimizer object -- no momentum, no Adam-style moment estimates, no
+      weight decay, no LR schedule, no gradient clipping. Attention/feed-forward weights
+      still have no gradient signal at all (see "Add proper momentum / optimizer for
+      expert parameters" below, which this generalizes).
+- [ ] Checkpoint resume (depends on serialization below)
+
+### Persistence
+- [ ] The RAG `VectorStore` is in-memory, brute-force, and vanishes on process exit --
+      fine for demos, not a durable knowledge base. Needs disk persistence and a real
+      index structure to scale past a toy corpus. (Also recall it's not currently wired
+      into the gate/logits at all yet -- see "Known gaps" below.)
+- [ ] Model serialization: save/load weights, vocabulary, training state (PID gains,
+      lasso mask, step count), and retrieval memory, ideally as versioned checkpoints.
+
+### Scale
+- [ ] Pure Python / nested lists throughout -- fine for learning and experimentation (see
+      README's "A note on performance"), slow for large vocab/matrices/corpora, no
+      vectorized backend. Same underlying gap as "Compile critical parts to C
+      extensions" in Long-Term Vision below, not a separate one.
+
+### If persistence is added: suggested storage
+- SQLite is the natural first choice (built into Python, single-file, easy to inspect):
+  tables for `vocab`, `samples`, `documents` (embeddings as BLOB), `checkpoints`,
+  `metrics`, and retrieval `memory`.
+- Simpler alternative at small scale: JSONL for samples/vocab plus a flat file or
+  separate vector cache for embeddings.
+
+### If a GUI is added
+- Not part of the original design -- flagging only because it came up in review, not
+  because one is assumed wanted. If pursued (e.g. Tkinter): keep the training loop off
+  the GUI's main thread. A mainloop-based GUI blocks on its own event loop, so running
+  training directly on it will freeze the UI.
+
+### Suggested build order (if pursuing the above)
+1. ~~Tokenizer~~ -- done
+2. ~~Dataset loader~~ -- done
+3. Storage schema (SQLite or the JSONL alternative)
+4. Checkpoint save/load
+5. A proper optimizer
+6. Batching
+7. Retrieval persistence
+8. Evaluation loop -- **partially done**: `FractalBrain.evaluate()` is the core read-only
+   primitive (forward pass + loss, no weight updates); a fuller harness (aggregate
+   metrics across a dataset, perplexity, etc.) is still open. See `train_on_text.py` for
+   it in use.
+9. GUI wrapper, if wanted, last -- once there's something stable underneath to expose
+
 ## Implemented Features
 - [x] Native matrix/vector library (`math_utils.py`)
 - [x] PID controller with anti‑windup, now with a `compute_output()` probe for meta-gradient estimation
@@ -26,7 +93,11 @@
 - [x] Gradient descent for each expert's output projection (`W_out`), via the exact softmax-cross-entropy gradient (CHANGELOG #22)
 - [x] Real meta-gradient descent for the PID gains, via cheap finite differences (CHANGELOG #9, #23)
 - [x] Adaptive temperature in softmax based on PID (previously listed under Medium-Term; this is what the PID gains now actually control -- CHANGELOG #7)
-- [x] Unit tests for each module (`tests/test_smoke.py`, 50 checks)
+- [x] Unit tests for each module (`tests/test_smoke.py`, 67 checks)
+- [x] BPE tokenizer with train/encode/decode/save/load (`tokenizer.BPETokenizer`)
+- [x] Text dataset with sliding-window examples and train/val/test split (`dataset.TextDataset`)
+- [x] Read-only `evaluate()` for validation/test metrics without training on them (`core.FractalBrain.evaluate()`)
+- [x] End-to-end real-text training example (`train_on_text.py`)
 
 ## Known gaps (found while fixing the above -- flagging rather than silently leaving)
 - [ ] JEPA's own encoder/predictor weights are never trained: the loss is computed and

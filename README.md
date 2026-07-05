@@ -27,14 +27,17 @@ your_project/
   fractal_brain/        <- the importable package -- copy this folder as-is
     __init__.py
     core.py
+    tokenizer.py         <- BPE tokenizer
+    dataset.py           <- next-token-prediction dataset + train/val/test split
     ...
-  how_to_use.py          <- minimal single-step example
-  orchestrator.py         <- fuller training-loop example
+  how_to_use.py           <- minimal single-step example
+  orchestrator.py         <- fuller training-loop example (synthetic data, distillation, TurboQuant, PCA)
+  train_on_text.py        <- tokenizer -> dataset -> train/val split -> training -> generation
   tests/
     test_smoke.py         <- regression test suite (python tests/test_smoke.py)
 ```
 
-The two example scripts and the package are siblings, not nested -- `fractal_brain/`
+The example scripts and the package are siblings, not nested -- `fractal_brain/`
 is imported *by* them, so it can't live inside itself.
 
 ## Installation
@@ -60,9 +63,14 @@ logits, loss = brain.step(token_ids, target)
 probs = brain.sample([12, 45], temperature=0.7)
 ```
 
-See `how_to_use.py` for a runnable version of this, and `orchestrator.py` for a full
-training loop (synthetic dataset, distillation against a frozen teacher, periodic
-`TurboQuant` compression stats and `PCA` inspection of the embedding table).
+See `how_to_use.py` for a runnable version of this, `orchestrator.py` for a full
+training loop on synthetic data (distillation against a frozen teacher, periodic
+`TurboQuant` compression stats and `PCA` inspection of the embedding table), and
+`train_on_text.py` for the full data pipeline on real text: a from-scratch BPE
+tokenizer (`tokenizer.BPETokenizer`), a next-token-prediction dataset with a proper
+train/val/test split (`dataset.TextDataset`), and validation via `FractalBrain.evaluate()`
+(a read-only counterpart to `step()` -- calling `step()` itself on held-out data would
+silently train on it).
 
 ## A note on performance
 
@@ -80,7 +88,7 @@ path to real speed (compiling the hot loops as C extensions).
 python tests/test_smoke.py
 ```
 
-Runs a dependency-free suite of 50 checks covering every module, including regression
+Runs a dependency-free suite of 67 checks covering every module, including regression
 tests for each bug listed in `CHANGELOG.md`.
 
 ## Status

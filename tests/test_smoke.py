@@ -25,7 +25,7 @@ from fractal_brain import (
     MultiHeadAttention, TransformerEncoderLayer, TransformerExpert, GatedMoE,
     VectorStore, StateRAGFusion, BCMPlasticity, TurboQuant, PCA, Wormhole,
     LogicFolder, fuzzy_and, fuzzy_or, fuzzy_not, FractalMatrix, JEPA, Value,
-    DelayLine, distillation_loss,
+    DelayLine, distillation_loss, BPETokenizer, TextDataset,
 )
 
 PASSED = []
@@ -351,7 +351,86 @@ check("model reaches high accuracy on the memorized examples", correct >= 7, f"{
 
 
 # ============================================================================
+section("tokenizer.BPETokenizer")
+# ============================================================================
+tiny_corpus = [
+    "the quick brown fox jumps over the lazy dog",
+    "the lazy dog sleeps all day in the warm sun",
+    "the quick fox runs through the green forest",
+]
+btok = BPETokenizer(lowercase=True)
+btok.train(tiny_corpus, vocab_size=80)
+check("BPETokenizer learns a vocab", btok.vocab_size > 4)
+ids = btok.encode("the quick fox")
+check("BPETokenizer.encode returns ids", len(ids) > 0 and all(isinstance(i, int) for i in ids))
+decoded = btok.decode(btok.encode(tiny_corpus[0]))
+check("BPETokenizer round-trips training sentences exactly", decoded == tiny_corpus[0], f"{decoded!r}")
+try:
+    btok.encode("zzq")  # unseen single characters -> UNK, must not crash
+    check("BPETokenizer.encode handles unseen characters without crashing", True)
+except Exception as e:
+    check("BPETokenizer.encode handles unseen characters without crashing", False, str(e))
+try:
+    BPETokenizer().train(tiny_corpus, vocab_size=2)
+    check("BPETokenizer rejects too-small vocab_size", False, "did not raise")
+except ValueError:
+    check("BPETokenizer rejects too-small vocab_size", True)
+btok.save("/tmp/_test_tokenizer_vocab.json")
+btok2 = BPETokenizer.load("/tmp/_test_tokenizer_vocab.json")
+check("BPETokenizer save/load round-trips vocab size", btok2.vocab_size == btok.vocab_size)
+check("BPETokenizer save/load round-trips encoding", btok2.encode("the quick fox") == btok.encode("the quick fox"))
+
+
+# ============================================================================
+section("dataset.TextDataset")
+# ============================================================================
+ds = TextDataset(btok, tiny_corpus, context_length=4, stride=1)
+check("TextDataset builds examples", len(ds) > 0)
+ctx, tgt = ds[0]
+check("TextDataset example shapes", len(ctx) == 4 and len(tgt) == btok.vocab_size and abs(sum(tgt) - 1.0) < 1e-9)
+tr, va, te = ds.split(train_frac=0.7, val_frac=0.15, seed=0)
+check("TextDataset.split sizes sum to total", len(tr) + len(va) + len(te) == len(ds))
+overlap = set(tr.indices) & set(va.indices) | set(tr.indices) & set(te.indices) | set(va.indices) & set(te.indices)
+check("TextDataset.split has no overlap between train/val/test", len(overlap) == 0)
+short = TextDataset(btok, ["hi"], context_length=8)
+check("TextDataset handles a too-short text without crashing", len(short) == 0)
+
+
+# ============================================================================
+section("core.FractalBrain.evaluate() (read-only counterpart to step())")
+# ============================================================================
+set_seed(6)
+brain4 = FractalBrain(vocab_size=25, d_model=12, num_experts=4, num_heads=2, d_ff=24,
+                      num_layers=1, num_markov_nodes=3, markov_states=3, max_level=1)
+toks_e = [1, 2, 3]
+tgt_e = [0.0]*25
+tgt_e[5] = 1.0
+
+def _w_out_snapshot(b):
+    return [[row[:] for row in e.W_out.data] for e in b.moe.experts]
+
+before_w = _w_out_snapshot(brain4)
+before_pid = (brain4.pid.Kp, brain4.pid.Ki, brain4.pid.Kd)
+before_steps = brain4.step_count
+_, eval_loss = brain4.evaluate(toks_e, tgt_e)
+after_w = _w_out_snapshot(brain4)
+after_pid = (brain4.pid.Kp, brain4.pid.Ki, brain4.pid.Kd)
+after_steps = brain4.step_count
+
+check("evaluate() does not change any expert's W_out", before_w == after_w)
+check("evaluate() does not change PID gains", before_pid == after_pid)
+check("evaluate() does not advance step_count", before_steps == after_steps)
+check("evaluate() returns a finite loss", math.isfinite(eval_loss))
+
+before_w2 = _w_out_snapshot(brain4)
+brain4.step(toks_e, tgt_e)
+after_w2 = _w_out_snapshot(brain4)
+check("step() (unlike evaluate()) does change W_out -- confirms evaluate() isn't just a no-op forward", before_w2 != after_w2)
+
+
+# ============================================================================
 print(f"\n{'='*60}\n{len(PASSED)} passed, {len(FAILED)} failed\n{'='*60}")
+
 if FAILED:
     print("FAILURES:")
     for name, detail in FAILED:

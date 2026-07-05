@@ -1,8 +1,61 @@
 # Changelog
 
-This describes what changed from the version you uploaded, and why. Everything below
-was verified empirically (not just read and reasoned about) via `tests/test_smoke.py`
-and the extended training runs described inline.
+## Data pipeline: tokenizer, dataset, and a read-only `evaluate()` (new capability)
+
+This is new capability, not a bug fix -- covering the "Tokenizer", "Vocabulary
+builder", "Dataset loader", "Text cleaning / normalization", and "Train / validation /
+test split" items from `To-Do.md`'s data-pipeline section (items 1-2 of its suggested
+build order).
+
+- **`tokenizer.BPETokenizer`**: a real byte-pair-encoding tokenizer, trained from raw
+  text with no external dependencies -- not a placeholder. Learns merges from a corpus,
+  encodes text to token ids and decodes back, with save/load to JSON. Two limitations
+  are documented rather than glossed over: it splits words into Unicode code points (not
+  grapheme clusters), and `decode()` is an *approximate* detokenizer (a simple heuristic
+  reconstructs spacing around punctuation) rather than an exact inverse of `encode()` --
+  a fully exact round trip would need whitespace itself folded into the vocabulary
+  (byte-level BPE, as in GPT-2), which is a larger undertaking than warranted here.
+- **`dataset.TextDataset`**: turns a tokenizer + raw text into sliding-window
+  `(context_token_ids, target_one_hot)` next-token-prediction examples, with
+  `.split(train_frac, val_frac, seed)` for a shuffled, non-overlapping train/val/test
+  split (verified: `tests/test_smoke.py` checks the three splits never share an index).
+  Deliberately produces one example at a time rather than batching -- `FractalBrain.step()`
+  itself only accepts one sequence per call today, so batching is out of scope until that
+  changes too (see `To-Do.md`'s "Batching" item, still open).
+- **`core.FractalBrain.evaluate()`**: while wiring up a demo that trains on `train` and
+  reports loss on `val`/`test`, I found that doing the obvious thing -- calling `step()`
+  on the validation examples too -- would silently *train* on them, since `step()` has no
+  read-only mode. `evaluate()` fixes that: the identical forward pass and loss
+  computation as `step()` (both now share a `_compute_losses()` helper, extracted from
+  `step()` so the two can't drift apart on what "the loss" means), but without applying
+  the output-projection gradient step, the PID meta-update, BCM plasticity, or pruning.
+  It deliberately still advances the fractal Markov chain's internal state and the
+  embedding delay line, same as `step()` does -- those are the model's ongoing internal
+  dynamics, not something being fit to whatever you evaluate on, so freezing them seemed
+  more wrong than right; see the method's own docstring for the full reasoning. This is a
+  partial answer to the "Evaluation loop" item in the suggested build order -- the core
+  read-only primitive exists now, a fuller harness (aggregate metrics, perplexity, etc.)
+  is still open.
+- **`train_on_text.py`**: a new end-to-end example (tokenizer -> dataset -> train/val
+  split -> training -> greedy generation) demonstrating all of the above together. Worth
+  noting what it actually shows: on the tiny demo corpus, train_loss drops from ~4.4 to
+  ~0.25 over 25 epochs while val_loss *rises* from ~4.5 to ~5.4 -- textbook overfitting on
+  a too-small corpus, and also a good sign that `evaluate()` genuinely isn't leaking
+  training signal into the validation numbers (if it were, val_loss would track
+  train_loss downward instead of diverging from it).
+
+Verified: 17 new checks in `tests/test_smoke.py` (67 total, all passing), plus manual
+confirmation that `how_to_use.py` and `orchestrator.py` produce byte-identical loss
+values to before this round's `core.py` refactor (i.e. `step()`'s behavior is unchanged;
+only `evaluate()` and the internal `_compute_losses()` extraction are new).
+
+---
+
+# Original fixes
+
+This describes what changed from the version you originally uploaded, and why.
+Everything below was verified empirically (not just read and reasoned about) via
+`tests/test_smoke.py` and the extended training runs described inline.
 
 The short version: **the library could not be imported at all** in either of the two
 ways it's meant to be used (see below), and once that's fixed, two of the architecture's
