@@ -2,15 +2,16 @@
 fractal_brain/dataset.py
 A minimal, dependency-free dataset loader: turns raw text into sliding-window
 (context_token_ids, target_one_hot) next-token-prediction examples using a tokenizer,
-with train/validation/test splitting.
+with train/validation/test splitting and batching.
 
-Covers the "Dataset loader" and "Train / validation / test split" items from
-To-Do.md's data pipeline section.
+Covers the "Dataset loader", "Train / validation / test split", and "Batching" items
+from To-Do.md's data pipeline section.
 
-Deliberately produces one example at a time, matching FractalBrain.step()'s current
-single-sequence interface -- batching/padding is a separate, later To-Do item, since it
-needs changes to FractalBrain itself (which processes one sequence per call today), not
-just to data loading.
+.batches() yields plain lists of (context, target) pairs with no padding -- see
+core.FractalBrain.train_batch()'s docstring for why that's fine here: each example
+still gets its own independent forward pass (there's no stacked-tensor batch dimension
+anywhere in this architecture to pad *for*), and what batching buys you is gradient
+averaging over several examples before one optimizer step, not a vectorized speedup.
 """
 import random
 
@@ -56,6 +57,22 @@ class TextDataset:
         for i in range(len(self)):
             yield self[i]
 
+    def batches(self, batch_size, shuffle=False, seed=None, drop_last=False):
+        """
+        Yield lists of (context, target) pairs of length batch_size (the last batch may
+        be shorter unless drop_last=True), ready to hand straight to
+        core.FractalBrain.train_batch(). No padding is applied -- see train_batch()'s
+        docstring for why that's fine here.
+        """
+        idxs = list(range(len(self)))
+        if shuffle:
+            random.Random(seed).shuffle(idxs)
+        for start in range(0, len(idxs), batch_size):
+            chunk = idxs[start:start + batch_size]
+            if drop_last and len(chunk) < batch_size:
+                return
+            yield [self[i] for i in chunk]
+
     def split(self, train_frac=0.8, val_frac=0.1, seed=0):
         """
         Shuffle example indices and split into (train, val, test) views. Returns
@@ -91,6 +108,18 @@ class DatasetView:
     def __iter__(self):
         for i in range(len(self)):
             yield self[i]
+
+    def batches(self, batch_size, shuffle=False, seed=None, drop_last=False):
+        """Same as TextDataset.batches() -- yield lists of (context, target) pairs of
+        length batch_size, ready for core.FractalBrain.train_batch()."""
+        idxs = list(range(len(self)))
+        if shuffle:
+            random.Random(seed).shuffle(idxs)
+        for start in range(0, len(idxs), batch_size):
+            chunk = idxs[start:start + batch_size]
+            if drop_last and len(chunk) < batch_size:
+                return
+            yield [self[i] for i in chunk]
 
     def shuffle(self, seed=None):
         """Shuffle this view's index order in place (e.g. once per training epoch)."""

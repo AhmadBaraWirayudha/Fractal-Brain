@@ -56,16 +56,18 @@ from .wormhole import Wormhole
 from .jepa import JEPA
 from .signal import DelayLine
 from .core import FractalBrain
+from .optimizer import SGD, Adam, ConstantLR, StepLR, CosineAnnealingLR, LinearWarmupLR
 
 FORMAT_VERSION = 1
 
 # Classes reconstructable by name. Extend via register_checkpoint_class() if you add
 # your own stateful classes that can end up as an attribute somewhere inside a
-# FractalBrain (subclasses, custom modules, etc).
+# FractalBrain (subclasses, custom modules, custom optimizers/schedulers, etc).
 _REGISTRY = {cls.__name__: cls for cls in [
     FractalBrain, PIDController, FractalMarkovNode, BootstrapGate, LassoTentacles,
     GatedMoE, TransformerExpert, TransformerEncoderLayer, MultiHeadAttention,
     VectorStore, StateRAGFusion, BCMPlasticity, Wormhole, JEPA, DelayLine,
+    SGD, Adam, ConstantLR, StepLR, CosineAnnealingLR, LinearWarmupLR,
 ]}
 
 

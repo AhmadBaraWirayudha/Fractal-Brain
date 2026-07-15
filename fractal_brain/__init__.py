@@ -32,6 +32,9 @@ from .checkpoint import (
     register_checkpoint_class,
 )
 from .storage import Storage
+from .interfaces import Encoder, Decoder
+from .encoder_decoder import NativeEncoder, NativeAutoregressiveDecoder, RobertaAdapter, GPTAdapter, FusionModel
+from .version import __version__
 
 __all__ = [
     # math_utils
@@ -80,4 +83,8 @@ __all__ = [
     "register_checkpoint_class",
     # storage
     "Storage",
+    # encoder-decoder fusion
+    "Encoder", "Decoder",
+    "NativeEncoder", "NativeAutoregressiveDecoder", "RobertaAdapter", "GPTAdapter", "FusionModel",
+    "__version__",
 ]

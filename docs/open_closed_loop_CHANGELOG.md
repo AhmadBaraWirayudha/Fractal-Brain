@@ -1,0 +1,3 @@
+# Changelog
+
+- Pure-Python rewrite.
