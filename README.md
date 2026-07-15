@@ -1,6 +1,4 @@
-# Hybrid Cognitive AI Pipeline
-
-This workspace now runs as one end-to-end AI system rather than two separate demos.
+# Fractal Brain
 
 ## Pipeline stages
 
@@ -13,7 +11,7 @@ This workspace now runs as one end-to-end AI system rather than two separate dem
 7. **Reflect** on confidence, retrieved memory, and correction signals.
 8. **Learn from feedback** when the result is corrected.
 
-## Run the unified pipeline
+## Run the pipeline
 
 ```bash
 python hybrid_cli.py --mode pipeline
