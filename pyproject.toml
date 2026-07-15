@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hybrid-fused-brain"
+version = "0.1.0"
+description = "Merged pure-Python closed-loop engine and fractal brain architectures"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = []
+
+[tool.setuptools]
+py-modules = [
+  "engine",
+  "tokenizer",
+  "memory",
+  "moe_model",
+  "planner",
+  "quantization",
+  "decomposer",
+  "decoder",
+  "demo",
+  "ai_pipeline",
+  "hybrid_engine",
+  "hybrid_cli",
+  "train_on_text",
+  "how_to_use",
+  "orchestrator",
+  "persistence_demo",
+]
+packages = ["fractal_brain", "ocle_clean_build"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests", "ocle_clean_build/tests"]

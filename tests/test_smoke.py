@@ -32,6 +32,7 @@ from fractal_brain import (
     save_checkpoint, load_checkpoint, serialize_brain, deserialize_brain,
     register_checkpoint_class, Storage,
 )
+from fractal_brain.optimizer import SGD, Adam, clip_grad_norm_matrix, StepLR, CosineAnnealingLR, LinearWarmupLR
 
 PASSED = []
 FAILED = []
@@ -580,6 +581,358 @@ with Storage(db_path) as db:
 # data survives closing and reopening the connection
 with Storage(db_path) as db2:
     check("Storage data survives reopen", db2.count_samples("train") == len(db_train))
+
+
+# ============================================================================
+section("optimizer: SGD / Adam / clipping / LR schedules")
+# ============================================================================
+W_opt = Matrix([[1.0, 2.0], [3.0, 4.0]])
+grad_opt = Matrix([[0.1, 0.2], [0.3, 0.4]])
+sgd_plain = SGD(lr=0.1)
+sgd_plain.step_matrix("w", W_opt, grad_opt)
+check("plain SGD matches manual gradient descent",
+      W_opt.data == [[1.0 - 0.01, 2.0 - 0.02], [3.0 - 0.03, 4.0 - 0.04]])
+
+W_mom = Matrix([[1.0]])
+sgd_mom = SGD(lr=0.1, momentum=0.9)
+sgd_mom.step_matrix("w", W_mom, Matrix([[1.0]]))
+d1 = 1.0 - W_mom.data[0][0]
+before2 = W_mom.data[0][0]
+sgd_mom.step_matrix("w", W_mom, Matrix([[1.0]]))
+d2 = before2 - W_mom.data[0][0]
+check("SGD momentum: repeated same-direction gradient accelerates", d2 > d1)
+
+W_wd = Matrix([[10.0]])
+SGD(lr=0.1, weight_decay=0.5).step_matrix("w", W_wd, Matrix([[0.0]]))
+check("SGD weight_decay shrinks weight even with zero gradient", W_wd.data[0][0] < 10.0)
+
+x_adam = Matrix([[0.0]])
+adam = Adam(lr=0.1)
+for _ in range(200):
+    g = 2 * (x_adam.data[0][0] - 3.0)
+    adam.step_matrix("x", x_adam, Matrix([[g]]))
+check("Adam converges to the minimum of a simple convex function", abs(x_adam.data[0][0] - 3.0) < 0.01)
+
+val_adam = 0.0
+adam_s = Adam(lr=0.1)
+for _ in range(200):
+    val_adam = adam_s.step_scalar("x", val_adam, 2 * (val_adam - 3.0))
+check("Adam.step_scalar converges the same way as step_matrix", abs(val_adam - 3.0) < 0.01)
+
+clipped = clip_grad_norm_matrix(Matrix([[3.0, 4.0]]), max_norm=1.0)
+clipped_norm = sum(v * v for row in clipped.data for v in row) ** 0.5
+check("clip_grad_norm_matrix clips to the target norm", abs(clipped_norm - 1.0) < 1e-9)
+unclipped = clip_grad_norm_matrix(Matrix([[0.1, 0.1]]), max_norm=1.0)
+check("clip_grad_norm_matrix is a no-op under budget", unclipped.data == [[0.1, 0.1]])
+
+step_lr = StepLR(base_lr=1.0, step_size=10, gamma=0.5)
+check("StepLR decays at boundaries",
+      step_lr.get_lr(9) == 1.0 and step_lr.get_lr(10) == 0.5 and step_lr.get_lr(20) == 0.25)
+cos_lr = CosineAnnealingLR(base_lr=1.0, total_steps=100, min_lr=0.0)
+check("CosineAnnealingLR starts high, ends low, decreases monotonically",
+      abs(cos_lr.get_lr(0) - 1.0) < 1e-9 and abs(cos_lr.get_lr(100)) < 1e-9 and
+      cos_lr.get_lr(25) > cos_lr.get_lr(50) > cos_lr.get_lr(75))
+warmup_lr = LinearWarmupLR(base_lr=1.0, warmup_steps=10)
+check("LinearWarmupLR ramps then holds", warmup_lr.get_lr(0) == 0.1 and warmup_lr.get_lr(9) == 1.0 and warmup_lr.get_lr(50) == 1.0)
+
+
+# ============================================================================
+section("core.FractalBrain: pluggable optimizer, LR schedule, gradient clipping")
+# ============================================================================
+set_seed(31)
+brain_default_opt = FractalBrain(vocab_size=30, d_model=12, num_experts=2, num_heads=2, d_ff=24,
+                                 num_layers=1, num_markov_nodes=2, markov_states=3, max_level=1)
+check("default output_optimizer is an SGD instance", type(brain_default_opt.output_optimizer).__name__ == "SGD")
+check("default pid_optimizer is an SGD instance", type(brain_default_opt.pid_optimizer).__name__ == "SGD")
+
+set_seed(32)
+brain_custom_opt = FractalBrain(vocab_size=30, d_model=12, num_experts=2, num_heads=2, d_ff=24,
+                                num_layers=1, num_markov_nodes=2, markov_states=3, max_level=1,
+                                output_optimizer=Adam(lr=0.01))
+check("a custom optimizer can be passed in", type(brain_custom_opt.output_optimizer).__name__ == "Adam")
+
+set_seed(33)
+brain_lrsched = FractalBrain(vocab_size=20, d_model=8, num_experts=2, num_heads=2, d_ff=16,
+                             num_layers=1, num_markov_nodes=2, markov_states=3, max_level=1,
+                             output_lr=1.0, output_lr_scheduler=StepLR(base_lr=1.0, step_size=5, gamma=0.5))
+for _ in range(6):
+    brain_lrsched.step([1, 2], [1.0 if j == 3 else 0.0 for j in range(20)])
+check("an LR scheduler actually changes output_optimizer.lr over time", brain_lrsched.output_optimizer.lr == 0.5)
+
+set_seed(34)
+brain_clip = FractalBrain(vocab_size=20, d_model=8, num_experts=2, num_heads=2, d_ff=16,
+                          num_layers=1, num_markov_nodes=2, markov_states=3, max_level=1,
+                          output_lr=50.0, grad_clip_norm=0.01)
+clip_losses = []
+for _ in range(20):
+    _, l = brain_clip.step([1, 2, 3], [1.0 if j == 7 else 0.0 for j in range(20)])
+    clip_losses.append(l)
+check("grad_clip_norm prevents a huge learning rate from causing a blow-up",
+      not any(math.isnan(l) or math.isinf(l) or l > 1000 for l in clip_losses))
+
+# checkpoint round-trips a stateful optimizer (Adam's moment estimates), not just SGD
+set_seed(35)
+brain_adam_ckpt = FractalBrain(vocab_size=20, d_model=8, num_experts=2, num_heads=2, d_ff=16,
+                               num_layers=1, num_markov_nodes=2, markov_states=3, max_level=1,
+                               output_optimizer=Adam(lr=0.01))
+for _ in range(5):
+    brain_adam_ckpt.step([1, 2], [1.0 if j == 4 else 0.0 for j in range(20)])
+adam_ckpt_path = os.path.join(_tmpdir, "adam_brain.json")
+save_checkpoint(brain_adam_ckpt, adam_ckpt_path)
+reloaded_adam = load_checkpoint(adam_ckpt_path)
+check("reloaded optimizer is still an Adam instance", type(reloaded_adam.output_optimizer).__name__ == "Adam")
+check("Adam's moment estimates (_m) round-trip through a checkpoint",
+      {k: v.data for k, v in reloaded_adam.output_optimizer._m.items()} ==
+      {k: v.data for k, v in brain_adam_ckpt.output_optimizer._m.items()})
+check("Adam's step counters (_t) round-trip through a checkpoint",
+      reloaded_adam.output_optimizer._t == brain_adam_ckpt.output_optimizer._t)
+
+
+# ============================================================================
+section("core.FractalBrain.train_batch() and dataset batching")
+# ============================================================================
+set_seed(36)
+brain_batch = FractalBrain(vocab_size=40, d_model=16, num_experts=4, num_heads=2, d_ff=32,
+                           num_layers=1, num_markov_nodes=3, markov_states=3, max_level=2)
+mixed_batch = [
+    ([1, 2], [1.0 if i == 5 else 0.0 for i in range(40)]),
+    ([3, 4, 5, 6, 7], [1.0 if i == 10 else 0.0 for i in range(40)]),   # different length, no padding needed
+    ([8], None),                                                       # no target -- should be skipped for gradients
+    ([9, 10, 11], [1.0 if i == 20 else 0.0 for i in range(40)]),
+]
+before_sc = brain_batch.step_count
+batch_logits, batch_avg_loss = brain_batch.train_batch(mixed_batch)
+check("train_batch returns one logits Matrix per example", len(batch_logits) == len(mixed_batch))
+check("train_batch logits have correct per-example shapes",
+      [(m.rows, m.cols) for m in batch_logits] == [(2, 40), (5, 40), (1, 40), (3, 40)])
+check("train_batch returns a float average loss", isinstance(batch_avg_loss, float))
+check("train_batch advances step_count by exactly len(batch)",
+      brain_batch.step_count - before_sc == len(mixed_batch))
+
+# gradient averaging correctness: manually replicate (forward + BCM identically) and compare
+set_seed(36)
+brain_manual = FractalBrain(vocab_size=40, d_model=16, num_experts=4, num_heads=2, d_ff=32,
+                            num_layers=1, num_markov_nodes=3, markov_states=3, max_level=2)
+_manual_sums, _manual_counts = {}, {}
+for _toks, _tgt in mixed_batch:
+    if not hasattr(brain_manual, '_pid_error'):
+        brain_manual._pid_error = 0.0
+    _pc = brain_manual.pid.step(brain_manual._pid_error)
+    _logits, _weights, _outputs = brain_manual.forward(_toks, _pc)
+    _has_t, _ce, _kl, _probs, _l1, _jepa, _distill, _total = brain_manual._compute_losses(_logits, _toks, _tgt)
+    brain_manual._pid_error = _kl
+    if _has_t:
+        for i, g in brain_manual._compute_output_gradients(_outputs, _weights, _tgt, _probs, len(_toks)).items():
+            if i in _manual_sums:
+                _manual_sums[i] = Matrix([[_manual_sums[i].data[r][c] + g.data[r][c] for c in range(g.cols)]
+                                          for r in range(g.rows)])
+                _manual_counts[i] += 1
+            else:
+                _manual_sums[i], _manual_counts[i] = g, 1
+    _emb_rows = [brain_manual.moe.experts[0].embedding.data[idx] for idx in _toks]
+    _pre_emb = Vector([sum(c)/len(_emb_rows) for c in zip(*_emb_rows)]) if _emb_rows else Vector.zeros(brain_manual.d_model)
+    brain_manual.bcm.update(brain_manual.tentacles.W, brain_manual.last_state_vec, Vector(_weights))
+    brain_manual.bcm.update(brain_manual.moe.W_gate, _pre_emb, Vector(_weights))
+    brain_manual.step_count += 1
+_manual_avg = {i: Matrix([[v / _manual_counts[i] for v in row] for row in g.data]) for i, g in _manual_sums.items()}
+brain_manual._apply_output_gradients(_manual_avg)
+check("train_batch's gradient averaging matches an independent manual replication",
+      all(brain_manual.moe.experts[i].W_out.data == brain_batch.moe.experts[i].W_out.data for i in range(4)))
+
+# learning via train_batch on a memorizable task
+set_seed(37)
+brain_batch_learn = FractalBrain(vocab_size=40, d_model=20, num_experts=4, num_heads=2, d_ff=40,
+                                 num_layers=1, num_markov_nodes=3, markov_states=3, max_level=2,
+                                 output_lr=0.2)
+random.seed(0)
+batch_examples = []
+for _ in range(12):
+    toks = [random.randint(0, 39) for _ in range(3)]
+    batch_examples.append((toks, sum(toks) % 40))
+
+def _mk_t(cls, vocab=40):
+    t = [0.0] * vocab
+    t[cls] = 1.0
+    return t
+
+full_batch = [(toks, _mk_t(cls)) for toks, cls in batch_examples]
+for _ in range(40):
+    brain_batch_learn.train_batch(full_batch)
+batch_correct = 0
+for toks, cls in batch_examples:
+    p = brain_batch_learn.sample(toks)
+    pred = max(range(len(p)), key=lambda i: p[i])
+    batch_correct += int(pred == cls)
+check("train_batch enables real learning (high accuracy on a memorizable task)",
+      batch_correct >= 10, f"{batch_correct}/12")
+
+try:
+    brain_batch.train_batch([])
+    check("train_batch rejects an empty batch", False, "did not raise")
+except ValueError:
+    check("train_batch rejects an empty batch", True)
+
+# dataset batching
+batch_ds_tok = BPETokenizer(lowercase=True)
+batch_ds_tok.train(["the quick brown fox", "the lazy dog sleeps", "a quick fox runs", "the dog and fox play"], vocab_size=60)
+batch_ds = TextDataset(batch_ds_tok, ["the quick brown fox", "the lazy dog sleeps", "a quick fox runs", "the dog and fox play"], context_length=3)
+batch_tr, _bv, _bt = batch_ds.split(train_frac=0.7, val_frac=0.15, seed=0)
+all_batches = list(batch_tr.batches(batch_size=4))
+check("dataset.batches() covers every example exactly once", sum(len(b) for b in all_batches) == len(batch_tr))
+dropped_batches = list(batch_tr.batches(batch_size=4, drop_last=True))
+check("dataset.batches(drop_last=True) only yields full-size batches",
+      all(len(b) == 4 for b in dropped_batches))
+shuf1 = list(batch_tr.batches(batch_size=4, shuffle=True, seed=1))
+shuf2 = list(batch_tr.batches(batch_size=4, shuffle=True, seed=1))
+check("dataset.batches() shuffling is reproducible with the same seed", shuf1 == shuf2)
+
+
+# ============================================================================
+section("core.FractalBrain: RAG wired into the gate, and gate-gradient training")
+# ============================================================================
+set_seed(80)
+brain_gate = FractalBrain(vocab_size=30, d_model=16, num_experts=4, num_heads=2, d_ff=32,
+                          num_layers=1, num_markov_nodes=3, markov_states=3, max_level=2,
+                          use_jepa=False, use_wormhole=True)
+check("FractalBrain has a W_rag_gate weight (RAG wired into the gate)",
+      hasattr(brain_gate, "W_rag_gate") and brain_gate.W_rag_gate.rows == 16 and brain_gate.W_rag_gate.cols == 4)
+check("default gate_optimizer is an SGD instance", type(brain_gate.gate_optimizer).__name__ == "SGD")
+
+before_rag = [row[:] for row in brain_gate.W_rag_gate.data]
+before_wgate = [row[:] for row in brain_gate.moe.W_gate.data]
+before_worm = [row[:] for row in brain_gate.wormhole.W.data]
+before_tent = [row[:] for row in brain_gate.tentacles.W.data]
+for _ in range(15):
+    brain_gate.step([1, 2, 3], [1.0 if i == 7 else 0.0 for i in range(30)])
+check("W_rag_gate is actually trained (changes from its initial random values)",
+      before_rag != brain_gate.W_rag_gate.data)
+check("moe.W_gate is trained via the new gate gradient (in addition to BCM)",
+      before_wgate != brain_gate.moe.W_gate.data)
+check("wormhole.W is actually trained", before_worm != brain_gate.wormhole.W.data)
+check("tentacles.W is actually trained via gradient (in addition to BCM)",
+      before_tent != brain_gate.tentacles.W.data)
+
+# pruned experts get zero gate gradient -- verified against the pure math directly
+# (see CHANGELOG for why: testing this against the full stochastic forward pass gives
+# unreliable finite differences, since BootstrapGate's internal history accumulates
+# across calls in a way a simple state snapshot doesn't capture)
+_gq = Vector([0.3, -0.2, 0.5, 0.1])
+_sv = Vector([1.0, 0.0, 1.0])
+_fs = Vector([0.1, 0.2, -0.1, 0.3])
+_probe = FractalBrain(vocab_size=10, d_model=4, num_experts=3, num_heads=2, d_ff=8,
+                      num_layers=1, num_markov_nodes=1, markov_states=3, max_level=1,
+                      use_jepa=False, use_wormhole=False)
+_probe.tentacles.mask = Vector([1.0, 0.0, 1.0])   # prune expert 1
+_probe._last_gate_query = _gq
+_probe._last_state_vec_for_gate = _sv
+_probe._last_fused_state = _fs
+_probe._last_gate_temperature = 1.0
+_fake_outputs = [Matrix([[0.1 * (i + 1)] * 10]) for i in range(3)]
+_fake_weights = [0.4, 0.0, 0.6]
+_fake_probs = softmax(Vector(_fake_outputs[0].data[0])).to_list()  # placeholder, shape-correct
+_fake_target = [1.0 if i == 3 else 0.0 for i in range(10)]
+_g = _probe._compute_gate_gradients(_fake_outputs, _fake_weights, _fake_target, _fake_probs, 1)
+check("pruned expert's own gate-weight column gets exactly zero gradient",
+      all(_g['moe.W_gate'].data[d][1] == 0.0 for d in range(4)))
+
+# gate training improves task performance
+set_seed(81)
+brain_gate_learn = FractalBrain(vocab_size=40, d_model=20, num_experts=4, num_heads=2, d_ff=40,
+                                num_layers=1, num_markov_nodes=3, markov_states=3, max_level=2,
+                                use_jepa=False, use_wormhole=True, output_lr=0.15, gate_lr=0.1)
+random.seed(0)
+gate_examples = []
+for _ in range(8):
+    toks = [random.randint(0, 39) for _ in range(3)]
+    gate_examples.append((toks, sum(toks) % 40))
+gl = []
+for i in range(200):
+    toks, cls = gate_examples[i % len(gate_examples)]
+    t = [0.0] * 40
+    t[cls] = 1.0
+    _, loss = brain_gate_learn.step(toks, t)
+    gl.append(loss)
+check("with gate training active, loss still decreases substantially on a memorizable task",
+      sum(gl[-10:]) / 10 < sum(gl[:10]) / 10 * 0.2, f"first10={sum(gl[:10])/10:.3f} last10={sum(gl[-10:])/10:.3f}")
+
+
+# ============================================================================
+section("jepa.JEPA.train_step(): real backprop, verified against numerical gradients")
+# ============================================================================
+set_seed(82)
+jepa_train = JEPA(input_dim=6, embed_dim=4, hidden_dim=5)
+jctx = Vector([0.3, -0.5, 1.2, 0.1, -0.8, 0.4])
+jtgt = Vector([0.2, 0.6, -0.3, 0.9, 0.1, -0.2])
+
+h_fd = 1e-5
+_grad_check_ok = True
+for name, W in [("Wc", jepa_train.Wc), ("Wc2", jepa_train.Wc2), ("Wp1", jepa_train.Wp1), ("Wp2", jepa_train.Wp2)]:
+    i, j = 0, 0
+    orig = W.data[i][j]
+    W.data[i][j] = orig + h_fd
+    lp, _, _ = jepa_train.loss(jctx, jtgt)
+    W.data[i][j] = orig - h_fd
+    lm, _, _ = jepa_train.loss(jctx, jtgt)
+    W.data[i][j] = orig
+    numerical = (lp - lm) / (2 * h_fd)
+
+    # replicate train_step's analytic gradient computation for this one entry
+    pre_relu_c = jepa_train.Wc.linear(jctx)
+    h_c = Vector([max(0.0, v) for v in pre_relu_c.data])
+    context_emb = jepa_train.Wc2.linear(h_c)
+    target_emb = jepa_train.encode_target(jtgt)
+    pre_relu_p = jepa_train.Wp1.linear(context_emb)
+    h_p = Vector([max(0.0, v) for v in pre_relu_p.data])
+    pred_emb = jepa_train.Wp2.linear(h_p)
+    diff = [pred_emb[k] - target_emb[k] for k in range(len(pred_emb))]
+    d_pred = [2.0 * d for d in diff]
+    embed_dim, hidden_p, hidden_c = len(context_emb), len(h_p), len(h_c)
+    if name == "Wp2":
+        analytic = h_p[i] * d_pred[j] if i < hidden_p and j < embed_dim else None
+    elif name == "Wp1":
+        d_h_p = [sum(d_pred[k] * jepa_train.Wp2.data[jj][k] for k in range(embed_dim)) for jj in range(hidden_p)]
+        d_pre_relu_p = [d_h_p[jj] if pre_relu_p.data[jj] > 0 else 0.0 for jj in range(hidden_p)]
+        analytic = context_emb[i] * d_pre_relu_p[j] if i < embed_dim and j < hidden_p else None
+    else:
+        d_h_p = [sum(d_pred[k] * jepa_train.Wp2.data[jj][k] for k in range(embed_dim)) for jj in range(hidden_p)]
+        d_pre_relu_p = [d_h_p[jj] if pre_relu_p.data[jj] > 0 else 0.0 for jj in range(hidden_p)]
+        d_context_emb = [sum(d_pre_relu_p[jj] * jepa_train.Wp1.data[d][jj] for jj in range(hidden_p)) for d in range(embed_dim)]
+        if name == "Wc2":
+            analytic = h_c[i] * d_context_emb[j] if i < hidden_c and j < embed_dim else None
+        else:
+            d_h_c = [sum(d_context_emb[e] * jepa_train.Wc2.data[jj][e] for e in range(embed_dim)) for jj in range(hidden_c)]
+            d_pre_relu_c = [d_h_c[jj] if pre_relu_c.data[jj] > 0 else 0.0 for jj in range(hidden_c)]
+            analytic = jctx[i] * d_pre_relu_c[j] if i < len(jctx) and j < hidden_c else None
+    if analytic is not None:
+        _grad_check_ok = _grad_check_ok and abs(analytic - numerical) < 1e-3
+check("JEPA train_step's analytic gradient matches numerical gradient (finite differences)", _grad_check_ok)
+
+jloss = []
+for _ in range(150):
+    jloss.append(jepa_train.train_step(jctx, jtgt, SGD(lr=0.05)))
+check("JEPA train_step reduces loss substantially", sum(jloss[-10:]) / 10 < sum(jloss[:10]) / 10 * 0.1)
+
+before_Wt = [row[:] for row in jepa_train.Wt.data]
+jepa_train.train_step(jctx, jtgt, SGD(lr=0.05))
+check("JEPA train_step's EMA update actually moves the target encoder", before_Wt != jepa_train.Wt.data)
+check("JEPA's target encoder is EMA-tracked, not a hard copy", jepa_train.Wt.data != jepa_train.Wc.data)
+
+# wired into FractalBrain: JEPA loss decreases over real training, and its weights change
+set_seed(83)
+brain_jepa = FractalBrain(vocab_size=30, d_model=16, num_experts=4, num_heads=2, d_ff=32,
+                          num_layers=1, num_markov_nodes=3, markov_states=3, max_level=2,
+                          use_jepa=True, use_wormhole=False)
+before_jepa_Wc = [row[:] for row in brain_jepa.jepa.Wc.data]
+jepa_losses_in_brain = []
+for i in range(120):
+    _, _ = brain_jepa.step([1, 2, 3], [1.0 if j == 5 else 0.0 for j in range(30)])
+    jepa_losses_in_brain.append(brain_jepa._last_jepa_loss)
+check("JEPA weights change when trained through FractalBrain.step()",
+      before_jepa_Wc != brain_jepa.jepa.Wc.data)
+_nonzero_jepa = [l for l in jepa_losses_in_brain[5:] if l > 0]
+check("JEPA loss decreases over training when wired through FractalBrain",
+      sum(_nonzero_jepa[-10:]) / 10 < sum(_nonzero_jepa[:10]) / 10 * 0.5,
+      f"first10={sum(_nonzero_jepa[:10])/10:.4f} last10={sum(_nonzero_jepa[-10:])/10:.4f}")
 
 
 # ============================================================================

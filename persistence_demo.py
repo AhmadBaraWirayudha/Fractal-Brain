@@ -11,7 +11,6 @@ to re-run repeatedly.
 """
 import os
 import json
-import random
 
 from fractal_brain import FractalBrain, set_seed
 from fractal_brain.tokenizer import BPETokenizer
@@ -19,8 +18,13 @@ from fractal_brain.dataset import TextDataset
 from fractal_brain.storage import Storage
 from fractal_brain.checkpoint import serialize_brain, save_checkpoint, load_checkpoint
 
-DB_PATH = "demo.db"
-CHECKPOINT_PATH = "demo_checkpoint.json"
+# Written under var/ (ignored by .gitignore) rather than the repo root, so
+# running this demo doesn't litter multi-megabyte generated files into the
+# working tree. See CHANGELOG.
+_OUTPUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "var", "persistence_demo")
+os.makedirs(_OUTPUT_DIR, exist_ok=True)
+DB_PATH = os.path.join(_OUTPUT_DIR, "demo.db")
+CHECKPOINT_PATH = os.path.join(_OUTPUT_DIR, "demo_checkpoint.json")
 
 CORPUS = [
     "the quick brown fox jumps over the lazy dog",

@@ -1,7 +1,7 @@
 """
 train_on_text.py
 End-to-end example: raw text -> BPE tokenizer -> dataset (train/val/test split) ->
-FractalBrain training -> greedy generation.
+FractalBrain training (in batches, via a real optimizer) -> greedy generation.
 
 This is the thing orchestrator.py (synthetic random tokens, for exercising
 distillation/TurboQuant/PCA) deliberately doesn't do: train on real text through a real
@@ -11,10 +11,11 @@ so it doesn't secretly train on them -- see core.FractalBrain.evaluate()'s docst
 Run from the directory that contains both this file and the fractal_brain/ folder:
     python train_on_text.py
 """
-import random
 from fractal_brain import FractalBrain, set_seed
 from fractal_brain.tokenizer import BPETokenizer
 from fractal_brain.dataset import TextDataset
+from fractal_brain.optimizer import Adam
+from fractal_brain.checkpoint import serialize_brain, deserialize_brain
 
 # A small, repetitive corpus on purpose: with no real dataset/tokenizer/GPU behind it,
 # this is meant to demonstrate the pipeline works end-to-end and that the model can
@@ -44,22 +45,41 @@ def main():
     train, val, test = dataset.split(train_frac=0.75, val_frac=0.15, seed=0)
     print(f"dataset: {len(dataset)} examples -> {len(train)} train / {len(val)} val / {len(test)} test")
 
-    # 3. A small FractalBrain sized to the tiny vocabulary
+    # 3. A small FractalBrain sized to the tiny vocabulary. Passing an Adam optimizer
+    # here is optional -- omit output_optimizer entirely for the original plain-SGD
+    # behavior, or pass output_lr_scheduler=... / grad_clip_norm=... for more control;
+    # see optimizer.py.
     brain = FractalBrain(vocab_size=tokenizer.vocab_size, d_model=32, num_experts=4,
                          num_heads=2, d_ff=64, num_layers=1,
                          num_markov_nodes=4, markov_states=3, max_level=2,
-                         output_lr=0.15)
+                         output_optimizer=Adam(lr=0.01))
 
-    # 4. Train, checking validation loss each epoch with evaluate() (read-only --
+    # 4. Train in batches (gradients averaged over each batch before one optimizer
+    # step, rather than reacting to every single example -- see train_batch()'s
+    # docstring), checking validation loss each epoch with evaluate() (read-only --
     # does NOT train on the validation examples; see FractalBrain.evaluate())
+    #
+    # A corpus this small (8 sentences) overfits fast: train_loss keeps dropping
+    # while val_loss starts rising after the first couple of epochs. That's real
+    # and worth seeing, so the full curve is still printed below -- but training
+    # to the last epoch and generating from *that* state was needlessly using
+    # the most-overfit weights available. Instead, keep an in-memory snapshot
+    # (via serialize_brain(), no disk I/O) whenever val_loss improves, and
+    # restore the best one afterwards. See CHANGELOG.
     epochs = 25
+    batch_size = 8
+    best_val_loss = float('inf')
+    best_epoch = 0
+    best_snapshot = None
     for epoch in range(epochs):
         train.shuffle(seed=epoch)
         train_loss = 0.0
-        for context, target in train:
-            _, loss = brain.step(context, target)
+        n_batches = 0
+        for batch in train.batches(batch_size=batch_size):
+            _, loss = brain.train_batch(batch)
             train_loss += loss
-        train_loss /= len(train)
+            n_batches += 1
+        train_loss /= n_batches
 
         val_loss = 0.0
         for context, target in val:
@@ -67,12 +87,24 @@ def main():
             val_loss += loss
         val_loss /= max(1, len(val))
 
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            best_epoch = epoch + 1
+            best_snapshot = serialize_brain(brain)
+
         if (epoch + 1) % 5 == 0 or epoch == 0:
             print(f"epoch {epoch+1:2d}/{epochs}: train_loss={train_loss:.4f}  val_loss={val_loss:.4f}")
 
-    # 5. Held-out test loss (also via evaluate(), also not trained on)
+    print(f"\nbest val_loss={best_val_loss:.4f} at epoch {best_epoch} "
+          f"(final epoch val_loss={val_loss:.4f}) -- restoring that checkpoint")
+    if best_snapshot is not None:
+        brain = deserialize_brain(best_snapshot)
+
+    # 5. Held-out test loss (also via evaluate(), also not trained on) -- now
+    # computed from the best-validation checkpoint rather than the final,
+    # more-overfit one.
     test_loss = sum(brain.evaluate(c, t)[1] for c, t in test) / max(1, len(test))
-    print(f"\nfinal test_loss={test_loss:.4f}")
+    print(f"final test_loss={test_loss:.4f}")
 
     # 6. Greedy generation from a short prompt
     prompt_text = "the quick brown"
