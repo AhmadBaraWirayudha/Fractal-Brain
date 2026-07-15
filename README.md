@@ -50,8 +50,7 @@ python hybrid_cli.py --mode session --text "First question || Second question ||
   on the spot), using its own throwaway database so it's reproducible and
   never touches `data/engine.db`. Add `--run-tests` to also run the full
   test suite afterwards, or `--pause` to step through it manually.
-- `docs/INTERVIEW_PREP.md` -- talking points, likely questions, and honest
-  limitations if you're presenting or discussing this project.
+
 
 ## Docs
 
