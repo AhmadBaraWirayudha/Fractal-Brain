@@ -4,7 +4,7 @@ import argparse
 import json
 from typing import Sequence
 
-from engine import OpenClosedLoopEngine
+from engine import OpenClosedLoopEngine, parse_simple_yaml
 from ai_pipeline import UnifiedAIPipeline
 from fractal_brain import FractalBrain, set_seed
 
@@ -16,7 +16,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         '--mode',
-        choices=('pipeline', 'closed-loop', 'fractal', 'session', 'teach'),
+        choices=('pipeline', 'closed-loop', 'fractal', 'session', 'teach', 'tune'),
         default='pipeline',
         help='Select which subsystem to run.',
     )
@@ -39,6 +39,12 @@ def build_parser() -> argparse.ArgumentParser:
         '--notes',
         default=None,
         help='Optional notes for teach mode.',
+    )
+    parser.add_argument(
+        '--trials',
+        type=int,
+        default=10,
+        help='Number of trials for tune mode. Budget roughly 5-10s/trial (see docs/ADAPTIVE_OPTIMIZER.md): each trial builds and runs a full pipeline instance.',
     )
     return parser
 
@@ -81,6 +87,22 @@ def run_teach(text: str, config: str, ideal_output: str, notes: str | None) -> d
     return pipeline.teach_from_example(text, ideal_output or text, notes=notes)
 
 
+def run_tune(config: str, trials: int) -> dict:
+    from pathlib import Path
+    from pipeline_optimizer import build_pipeline_optimizer
+
+    config_path = Path(config)
+    base_config = parse_simple_yaml(config_path.read_text(encoding='utf-8'))
+    base_path = config_path.resolve().parent
+    optimizer, objective = build_pipeline_optimizer(base_config, base_path)
+    best = optimizer.optimize(objective, max_trials=trials, batch_size=1)
+    return {
+        'best_score': best.composite_score if best else None,
+        'best_config': best.config if best else None,
+        'summary': optimizer.get_summary_report(),
+    }
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -93,6 +115,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         payload = run_session(args.text, args.config)
     elif args.mode == 'teach':
         payload = run_teach(args.text, args.config, args.ideal_output, args.notes)
+    elif args.mode == 'tune':
+        payload = run_tune(args.config, args.trials)
     else:
         payload = run_pipeline(args.text, args.config)
 

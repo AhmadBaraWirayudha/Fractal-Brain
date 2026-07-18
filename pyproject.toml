@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hybrid-fused-brain"
-version = "0.1.0"
+version = "0.3.0"
 description = "Merged pure-Python closed-loop engine and fractal brain architectures"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -28,6 +28,11 @@ py-modules = [
   "how_to_use",
   "orchestrator",
   "persistence_demo",
+  "demo_showcase",
+  "run_tests",
+  "lkg",
+  "adaptive_optimizer",
+  "pipeline_optimizer",
 ]
 packages = ["fractal_brain", "ocle_clean_build"]
 

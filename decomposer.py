@@ -11,6 +11,13 @@ _ENGINEERING_KEYWORDS = (
     'motor', 'conveyor', 'shaft', 'thermal', 'fluid', 'structural', 'wear',
 )
 
+# The four intent labels decompose() can return, in the order it checks them.
+# Public (unlike the keyword tuples above) because engine.py's knowledge-graph
+# integration defines its "session_intent" entity's state set from this list;
+# keeping one source of truth means a new intent category added here is
+# automatically tracked there too, instead of silently going unrecognized.
+KNOWN_INTENTS: tuple[str, ...] = ('math_symbolic', 'coding', 'engineering', 'general')
+
 
 @dataclass
 class DecompositionResult:

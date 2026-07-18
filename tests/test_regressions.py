@@ -148,3 +148,77 @@ def test_ocle_clean_build_shim_fails_loudly_if_self_imported() -> None:
     )
     assert result.returncode != 0
     assert 'ImportError' in result.stderr
+
+
+def test_no_hardcoded_unix_temp_paths() -> None:
+    """tests/test_smoke.py used to hardcode "/tmp/_test_tokenizer_vocab.json"
+    for a save/load round-trip, which crashed on Windows (no /tmp there).
+    Guard against that whole class of bug reappearing anywhere: nothing in
+    the source tree should hardcode /tmp, /var, /home, /etc, or /usr as an
+    absolute path -- use tempfile.mkdtemp()/gettempdir() instead."""
+    import re
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    this_file = Path(__file__).resolve()
+    pattern = re.compile(r'''['"]/(?:tmp|var|home|etc|usr)/''')
+    offenders = []
+    for path in root.rglob('*.py'):
+        if '__pycache__' in path.parts or '.pytest_cache' in path.parts:
+            continue
+        if path.resolve() == this_file:
+            continue
+        text = path.read_text(encoding='utf-8', errors='ignore')
+        if pattern.search(text):
+            offenders.append(str(path.relative_to(root)))
+    assert not offenders, f'hardcoded Unix-only absolute paths found in: {offenders}'
+
+
+def test_lkg_entity_tracking_had_no_public_observation_path(tmp_path) -> None:
+    """Pins down the gap found while integrating lkg.py: the shipped
+    LivingKnowledgeGraph could define entity states and predict from them,
+    but had no public method to tell it what state was actually observed.
+    DiscreteMarkovChain.observe_transition existed but was reachable only
+    from the module's own tests, never from ParticleFilter or
+    LivingKnowledgeGraph itself -- so step() alone could never move a
+    prediction away from uniform. This guards the general property (not
+    just the specific fixed method, which has its own coverage in
+    tests/test_lkg.py) so a future refactor of lkg.py can't quietly
+    reopen it without a public entity-observation method of some kind."""
+    from lkg import LivingKnowledgeGraph
+
+    kg = LivingKnowledgeGraph(num_particles=10, forgetting_factor=0.99, seed=0)
+    kg.define_entity_states('probe', ['a', 'b'])
+    public_methods = [name for name in dir(kg) if not name.startswith('_')]
+    observation_methods = [
+        name for name in public_methods
+        if 'observe' in name.lower() or 'transition' in name.lower()
+    ]
+    assert observation_methods, (
+        'LivingKnowledgeGraph has no public method for recording an observed '
+        'entity transition -- entity-state tracking would be unusable from '
+        'real data again (see CHANGELOG.md, "Living Knowledge Graph merged '
+        'in and wired into the closed loop").'
+    )
+
+
+def test_knowledge_graph_initialize_is_idempotent(tmp_path) -> None:
+    """Same shape of bug as test_bootstrap_is_idempotent above, in the new
+    knowledge-graph wiring added alongside it: LivingKnowledgeGraph.
+    define_entity_states() unconditionally builds fresh DiscreteMarkovChain
+    instances, wiping any accumulated history, so OpenClosedLoopEngine must
+    guard against calling it again on a repeated initialize()."""
+    from engine import OpenClosedLoopEngine
+
+    db_path = tmp_path / 'engine.db'
+    engine = OpenClosedLoopEngine.from_default_config()
+    engine.config['paths']['sqlite_db'] = str(db_path)
+    engine.memory.sqlite_path = engine.memory._resolve_path(str(db_path))
+    engine.initialize()
+    engine.run('Solve the integral of 2x from 0 to 4.')
+    engine.run('Solve x^2 - 5x + 6 = 0.')
+
+    before = engine.knowledge_graph.get_current_state_distribution('session_intent')
+    engine.initialize()
+    after = engine.knowledge_graph.get_current_state_distribution('session_intent')
+    assert before == after

@@ -36,7 +36,7 @@ class PlanConditionedDecoder:
             float(model_cfg.get('repetition_penalty', 1.05)),
         )
 
-    def generate(self, query_text: str, sentences: list[str], token_batch: TokenBatch, retrieved_docs: list[MemoryDocument], decomposition: DecompositionResult, plan: PlanResult, cognitive_context: dict[str, Any] | None = None) -> str:
+    def generate(self, query_text: str, sentences: list[str], token_batch: TokenBatch, retrieved_docs: list[MemoryDocument], decomposition: DecompositionResult, plan: PlanResult, cognitive_context: dict[str, Any] | None = None, doc_confidence: dict[str, dict[str, float]] | None = None) -> str:
         self.backbone.initialize()
         prompt = self.backbone.build_prompt(
             query_text,
@@ -46,9 +46,16 @@ class PlanConditionedDecoder:
             [s.action for s in plan.steps],
             cognitive_context=cognitive_context,
         )
+        doc_confidence = doc_confidence or {}
         structured_context = {
             'retrieved': [
-                {'text': d.text, 'score': float(d.score), 'metadata': d.metadata}
+                {
+                    'doc_id': d.doc_id,
+                    'text': d.text,
+                    'score': float(d.score),
+                    'metadata': d.metadata,
+                    'kg_confidence': doc_confidence.get(d.doc_id, {}).get('mean'),
+                }
                 for d in retrieved_docs
             ],
             'plan_actions': [s.action for s in plan.steps],

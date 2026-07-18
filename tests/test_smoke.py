@@ -381,8 +381,10 @@ try:
     check("BPETokenizer rejects too-small vocab_size", False, "did not raise")
 except ValueError:
     check("BPETokenizer rejects too-small vocab_size", True)
-btok.save("/tmp/_test_tokenizer_vocab.json")
-btok2 = BPETokenizer.load("/tmp/_test_tokenizer_vocab.json")
+_tok_tmpdir = tempfile.mkdtemp(prefix="fractal_brain_test_")
+_tok_save_path = os.path.join(_tok_tmpdir, "_test_tokenizer_vocab.json")
+btok.save(_tok_save_path)
+btok2 = BPETokenizer.load(_tok_save_path)
 check("BPETokenizer save/load round-trips vocab size", btok2.vocab_size == btok.vocab_size)
 check("BPETokenizer save/load round-trips encoding", btok2.encode("the quick fox") == btok.encode("the quick fox"))
 

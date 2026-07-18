@@ -4,6 +4,13 @@ project:
 paths:
   sqlite_db: data/engine.db
   bootstrap_dataset: data/bootstrap_dataset.jsonl
+  # fractal_brain.storage.Storage db for PipelineFractalMemoryAdapter's
+  # elite/failed configuration persistence (pipeline_optimizer.py). Kept
+  # separate from sqlite_db: Storage's own `documents` table schema
+  # collides column-for-column with memory.VectorMemoryStore's (see
+  # CHANGELOG.md), so sharing one db file would corrupt whichever
+  # connects second.
+  optimizer_db: data/optimizer.db
 retrieval:
   backend: auto
   top_k: 3
@@ -34,6 +41,20 @@ quantization:
   quant_type: nf4
 decomposition:
   max_subtasks: 5
+knowledge_graph:
+  # Particle-filter width for LivingKnowledgeGraph (lkg.py). More particles
+  # trade runtime for a smoother posterior over fact confidence / entity
+  # transitions; 20 matches the module's own default.
+  num_particles: 20
+  # Exponential decay per predict() step, applied to fact confidence and
+  # source reliability alike. Matches the module's own default.
+  forgetting_factor: 0.95
+  seed: 42
+  # Below this mean confidence, a retrieved document is treated as
+  # historically unreliable for its matched intent -- used both by
+  # SharedMoEBackbone's generation-time caveat and ai_pipeline.py's
+  # reflection risk note, so the two stay in sync.
+  low_confidence_threshold: 0.4
 runtime:
   device: auto
   log_level: INFO

@@ -7,6 +7,17 @@ from typing import Any
 
 from quantization import build_quantization_settings
 
+# Shared with engine.py's close_loop(): a successful interaction's output
+# gets stored as a future retrievable "solved example" (see CHANGELOG.md,
+# "matched_intent confidence made purely feedback-driven" -- same entry
+# covers this). A caveat about *that specific past interaction's* knowledge-
+# graph confidence would go stale and misleading the moment it's echoed back
+# verbatim as someone else's "closest known solved example", possibly long
+# after the real confidence has moved on -- so engine.py strips any line
+# starting with this prefix before storing. Defined once, here, so the text
+# that builds the caveat and the text that strips it can't drift apart.
+KG_CAVEAT_PREFIX = 'Caution: this source has a weak track record'
+
 
 @dataclass
 class GenerationOutput:
@@ -16,12 +27,20 @@ class GenerationOutput:
 
 
 class SharedMoEBackbone:
-    def __init__(self, model_name: str, fallback_model_name: str, use_trust_remote_code: bool = False, quantization_mode: str = 'auto', retrieval_confidence_threshold: float = 0.5) -> None:
+    def __init__(self, model_name: str, fallback_model_name: str, use_trust_remote_code: bool = False, quantization_mode: str = 'auto', retrieval_confidence_threshold: float = 0.5, low_confidence_threshold: float = 0.4) -> None:
         self.model_name = model_name
         self.fallback_model_name = fallback_model_name
         self.use_trust_remote_code = use_trust_remote_code
         self.quantization_mode = quantization_mode
         self.retrieval_confidence_threshold = retrieval_confidence_threshold
+        # Below this, a retrieved document's knowledge-graph confidence
+        # (accumulated, feedback-adjusted trust in that specific document for
+        # this intent -- see lkg.py / engine.py) is treated as low enough to
+        # caveat even when its cosine similarity cleared
+        # retrieval_confidence_threshold above. Same threshold value
+        # ai_pipeline.py's reflection uses for the same signal, read from
+        # the same config field, so the two don't quietly drift apart.
+        self.low_confidence_threshold = low_confidence_threshold
         self.tokenizer = None
         self.model = None
 
@@ -29,12 +48,14 @@ class SharedMoEBackbone:
     def from_config(cls, config: dict[str, Any]) -> 'SharedMoEBackbone':
         model_cfg = config.get('model', {})
         q = config.get('quantization', {})
+        kg_cfg = config.get('knowledge_graph', {})
         return cls(
             model_cfg.get('model_name', 'mistralai/Mixtral-8x7B-Instruct-v0.1'),
             model_cfg.get('fallback_model_name', 'TinyLlama/TinyLlama-1.1B-Chat-v1.0'),
             bool(model_cfg.get('use_trust_remote_code', False)),
             str(q.get('mode', 'auto')),
             float(model_cfg.get('retrieval_confidence_threshold', 0.5)),
+            float(kg_cfg.get('low_confidence_threshold', 0.4)),
         )
 
     def initialize(self) -> None:
@@ -139,6 +160,21 @@ Answer with a concise, correct solution. Show the essential steps and final resu
                 'Closest known solved example:',
                 f"- {best['text']}",
             ]
+            kg_confidence = best.get('kg_confidence')
+            if kg_confidence is not None and kg_confidence < self.low_confidence_threshold:
+                # High lexical similarity doesn't mean the document has
+                # actually held up -- retrieval/embeddings here are
+                # hash-based keyword overlap (see docs/UNIFIED_PIPELINE.md's
+                # "Known limitations"), which a close match can satisfy while
+                # still being the wrong answer. The knowledge graph tracks
+                # that from real feedback (engine.close_loop), so a low
+                # score here means this specific document has a track record
+                # of not panning out for this intent, not just a hunch.
+                lines.append(
+                    f"{KG_CAVEAT_PREFIX} for this kind of "
+                    f"request (knowledge-graph confidence {kg_confidence:.2f}); verify "
+                    f"before relying on it."
+                )
             step_texts = [s for s in (best.get('metadata') or {}).get('step_texts') or [] if s]
             if step_texts:
                 lines.append('Steps from that example:')

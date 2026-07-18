@@ -137,8 +137,7 @@ def scene_4_teaches_and_learns(pipeline: UnifiedAIPipeline, args: argparse.Names
 def run_test_suite() -> None:
     banner("BONUS -- running the real test suite live (not a canned number)")
     t0 = time.time()
-    subprocess.run([sys.executable, "tests/test_smoke.py"], check=False)
-    subprocess.run([sys.executable, "-m", "pytest", "-q"], check=False)
+    subprocess.run([sys.executable, "run_tests.py"], check=False)
     print(f"\n  (finished in {time.time() - t0:.1f}s)")
 
 

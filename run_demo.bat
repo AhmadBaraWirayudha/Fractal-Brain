@@ -45,7 +45,7 @@ echo.
 echo   1. Run the showcase demo         (~10s,  4 real scenes)
 echo   2. Showcase demo + full test suite (~45s, most rigorous)
 echo   3. Ask the pipeline your own question
-echo   4. Run the full test suite only  (137 + 24 checks)
+echo   4. Run the full test suite only  (137 + 25 checks)
 echo   5. Open interview prep notes
 echo   6. Exit
 echo.
@@ -86,9 +86,7 @@ goto menu
 
 :tests
 echo.
-!PY_CMD! tests\test_smoke.py
-echo.
-!PY_CMD! -m pytest -q
+!PY_CMD! run_tests.py
 echo.
 pause
 goto menu

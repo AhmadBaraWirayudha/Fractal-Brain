@@ -1,4 +1,6 @@
-# Fractal Brain
+# Hybrid Cognitive AI Pipeline
+
+This workspace now runs as one end-to-end AI system rather than two separate demos.
 
 ## Pipeline stages
 
@@ -11,7 +13,18 @@
 7. **Reflect** on confidence, retrieved memory, and correction signals.
 8. **Learn from feedback** when the result is corrected.
 
-## Run the pipeline
+Alongside these, a `LivingKnowledgeGraph` (`lkg.py`) tracks each turn's task
+intent and retrieved documents' reliability across a session, feeding both
+the reflection step above and generation itself (a caution when a surfaced
+document has a poor track record). See `docs/UNIFIED_PIPELINE.md` for how it
+fits in.
+
+A separate, opt-in `adaptive_optimizer.py` can search `config.yaml`'s own
+tunable values (retrieval threshold, planner sizing, knowledge-graph
+particle count, ...) for a better-scoring configuration, run via
+`python hybrid_cli.py --mode tune`. See `docs/ADAPTIVE_OPTIMIZER.md`.
+
+## Run the unified pipeline
 
 ```bash
 python hybrid_cli.py --mode pipeline
@@ -50,13 +63,21 @@ python hybrid_cli.py --mode session --text "First question || Second question ||
   on the spot), using its own throwaway database so it's reproducible and
   never touches `data/engine.db`. Add `--run-tests` to also run the full
   test suite afterwards, or `--pause` to step through it manually.
-
+- `python run_tests.py` runs the full test suite directly (137-check smoke
+  script + pytest), installing pytest automatically first if it isn't
+  already present.
+- `docs/INTERVIEW_PREP.md` -- talking points, likely questions, and honest
+  limitations if you're presenting or discussing this project.
 
 ## Docs
 
 - [`docs/UNIFIED_PIPELINE.md`](docs/UNIFIED_PIPELINE.md) -- component map, CLI
   usage, config reference, and known limitations for the layer described
   above (`ai_pipeline.py` / `hybrid_cli.py` / `ocle_clean_build/`).
+- [`docs/ADAPTIVE_OPTIMIZER.md`](docs/ADAPTIVE_OPTIMIZER.md) -- the
+  hyperparameter search engine (`adaptive_optimizer.py` /
+  `pipeline_optimizer.py`): design, what it actually tunes, and honest
+  scope limits.
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md), [`docs/API_REFERENCE.md`](docs/API_REFERENCE.md),
   [`docs/TRAINING_GUIDE.md`](docs/TRAINING_GUIDE.md) -- the `fractal_brain/` package itself.
 

@@ -8,12 +8,36 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
-from decomposer import DecompositionResult, TaskDecomposer
+from decomposer import DecompositionResult, KNOWN_INTENTS, TaskDecomposer
 from decoder import PlanConditionedDecoder
-from memory import InteractionRecord, VectorMemoryStore
-from moe_model import SharedMoEBackbone
+from lkg import LivingKnowledgeGraph
+from memory import InteractionRecord, MemoryDocument, VectorMemoryStore
+from moe_model import KG_CAVEAT_PREFIX, SharedMoEBackbone
 from planner import MarkovChainPlanner, PlanResult
 from tokenizer import QueryTokenizer, SentenceSplitter, TextEmbedder
+
+SESSION_INTENT_ENTITY = 'session_intent'
+
+
+def _document_source(doc: MemoryDocument) -> str:
+    """Best-effort provenance label for a memory document, used as the
+    knowledge graph's per-source reliability key.
+
+    Documents get an explicit ``metadata['source']`` when added via
+    ``ai_pipeline.py``'s learning-memory path (``'pipeline_feedback'``) or
+    this file's success path (``'successful_interaction'``), but bootstrap
+    records (``data/bootstrap_dataset.jsonl`` via
+    ``VectorMemoryStore.bootstrap()``) only carry a boolean ``'bootstrap'``
+    flag, no ``'source'`` string -- this normalizes both cases into one
+    label space so the knowledge graph tracks reliability per *origin*
+    rather than splitting bootstrap data across an inconsistent key.
+    """
+    explicit = doc.metadata.get('source')
+    if explicit:
+        return str(explicit)
+    if doc.metadata.get('bootstrap'):
+        return 'bootstrap'
+    return 'unknown'
 
 
 @dataclass
@@ -56,8 +80,17 @@ class OpenClosedLoopEngine:
         self.decomposer = TaskDecomposer.from_config(self.config)
         self.backbone = SharedMoEBackbone.from_config(self.config)
         self.decoder = PlanConditionedDecoder.from_config(self.config, self.backbone)
+        self.knowledge_graph = LivingKnowledgeGraph.from_config(self.config)
         self.state = EngineState()
         self.initialized = False
+        # Guards define_entity_states() from re-running on a second
+        # initialize() call. define_entity_states() unconditionally
+        # rebuilds fresh DiscreteMarkovChain instances (see lkg.py), so
+        # calling it again would silently wipe every intent-transition
+        # observed so far -- and initialize() is explicitly re-called
+        # against the same engine elsewhere (test_bootstrap_is_idempotent),
+        # so this needs to be safe the same way bootstrap() already is.
+        self._kg_entities_defined = False
 
     @classmethod
     def from_default_config(cls) -> 'OpenClosedLoopEngine':
@@ -75,6 +108,9 @@ class OpenClosedLoopEngine:
         self.memory.initialize()
         self.planner.initialize()
         self._bootstrap()
+        if not self._kg_entities_defined:
+            self.knowledge_graph.define_entity_states(SESSION_INTENT_ENTITY, list(KNOWN_INTENTS))
+            self._kg_entities_defined = True
         self.initialized = True
 
     def _bootstrap(self) -> None:
@@ -94,8 +130,30 @@ class OpenClosedLoopEngine:
         query_embedding = self.embedder.embed_text(input_text)
         retrieved = self.memory.retrieve(query_embedding, top_k=int(self.config['retrieval']['top_k']))
         decomposition = self.decomposer.decompose(input_text, [d.text for d in retrieved])
+
+        # Knowledge-graph update: this turn's intent is a directly observed
+        # session_intent state (not latent). Retrieved documents are NOT
+        # recorded as matched_intent evidence here -- only close_loop()
+        # does that, from actual feedback. See CHANGELOG.md ("matched_intent
+        # confidence made purely feedback-driven") for why: an earlier
+        # version recorded retrieval itself as positive evidence weighted by
+        # doc.score, which created a per-document confidence floor of
+        # score/(score+1) that 100% negative feedback could never cross --
+        # worst for documents with the highest retrieval score, which are
+        # exactly the ones surfaced verbatim (no caveat needed, by this
+        # metric alone) by the retrieval_confidence_threshold gate below.
+        self.knowledge_graph.observe_entity_transition(SESSION_INTENT_ENTITY, decomposition.intent)
+        # Computed once, immediately after the update above, so both the
+        # decoder (trust signal for generation) and the returned payload
+        # below see the same values instead of re-querying the graph twice.
+        kg_snapshot = self._knowledge_graph_snapshot(decomposition.intent, retrieved)
+        doc_confidence = {
+            item['doc_id']: {'mean': item['mean'], 'variance': item['variance']}
+            for item in kg_snapshot['retrieved_doc_confidence']
+        }
+
         plan = self.planner.plan(query_embedding)
-        output = self.decoder.generate(input_text, sentences, token_batch, retrieved, decomposition, plan, cognitive_context=cognitive_context)
+        output = self.decoder.generate(input_text, sentences, token_batch, retrieved, decomposition, plan, cognitive_context=cognitive_context, doc_confidence=doc_confidence)
         self.memory.store_pending_interaction(
             InteractionRecord(
                 interaction_id,
@@ -119,6 +177,29 @@ class OpenClosedLoopEngine:
             'retrieved': [d.to_dict() for d in retrieved],
             'plan': plan.to_dict(),
             'output': output,
+            'knowledge_graph': kg_snapshot,
+        }
+
+    def _knowledge_graph_snapshot(self, intent: str, retrieved: list[MemoryDocument]) -> dict[str, Any]:
+        """Summarize the knowledge graph's view of this turn: which intent it
+        expects next given the session's history so far, and how much it
+        currently trusts each retrieved document for the intent just
+        observed. Read-only -- this doesn't itself call add_fact/
+        observe_entity_transition, both already applied above."""
+        predicted = self.knowledge_graph.predict_entity_state(SESSION_INTENT_ENTITY, horizon=1)
+        distribution = dict(zip(KNOWN_INTENTS, (round(float(p), 4) for p in predicted)))
+        predicted_next_intent = max(distribution, key=distribution.get) if distribution else None
+        return {
+            'predicted_next_intent': predicted_next_intent,
+            'predicted_intent_distribution': distribution,
+            'retrieved_doc_confidence': [
+                {
+                    'doc_id': doc.doc_id,
+                    'source': _document_source(doc),
+                    **self.knowledge_graph.get_confidence(doc.doc_id, 'matched_intent', intent),
+                }
+                for doc in retrieved
+            ],
         }
 
     def close_loop(self, feedback: dict[str, Any]) -> dict[str, Any]:
@@ -129,8 +210,24 @@ class OpenClosedLoopEngine:
         corrected_output = feedback.get('corrected_output')
         notes = feedback.get('notes')
         stored = self.memory.finalize_interaction(interaction_id, success, corrected_output, notes)
+
+        if self.state.last_decomposition is not None:
+            doc_by_id = {d.doc_id: d for d in self.memory.documents}
+            for doc_id in self.state.last_retrieved_ids:
+                doc = doc_by_id.get(doc_id)
+                source = _document_source(doc) if doc is not None else 'unknown'
+                self.knowledge_graph.add_fact(
+                    doc_id, 'matched_intent', self.state.last_decomposition.intent,
+                    source=source,
+                    positive=success,
+                )
+
         if success and self.state.last_plan is not None and self.state.last_input_text:
             solution_text = corrected_output or self.state.last_output or ''
+            solution_text = '\n'.join(
+                line for line in solution_text.splitlines()
+                if not line.startswith(KG_CAVEAT_PREFIX)
+            )
             self.memory.add_document(
                 solution_text,
                 self.embedder.embed_text(solution_text),
@@ -239,6 +336,48 @@ def parse_scalar(value: str) -> Any:
     if re.fullmatch(r'[-+]?\d*\.\d+(?:[eE][-+]?\d+)?', value) or re.fullmatch(r'[-+]?\d+(?:[eE][-+]?\d+)', value):
         return float(value)
     return value
+
+
+def dump_scalar(value: Any) -> str:
+    """Inverse of parse_scalar for one value. Quotes strings that would
+    otherwise round-trip as the wrong type (looks like a number/bool/null,
+    contains ': ', or is empty)."""
+    if value is None:
+        return 'null'
+    if isinstance(value, bool):
+        return 'true' if value else 'false'
+    if isinstance(value, (int, float)):
+        return str(value)
+    if isinstance(value, list):
+        return '[' + ', '.join(dump_scalar(v) for v in value) + ']'
+    text = str(value)
+    needs_quoting = (
+        text == ''
+        or parse_scalar(text) != text
+        or ': ' in text
+        or text.startswith('- ')
+    )
+    if needs_quoting:
+        return "'" + text.replace("'", "''") + "'"
+    return text
+
+
+def dump_simple_yaml(data: dict[str, Any], indent: int = 0) -> str:
+    """Inverse of parse_simple_yaml: dict -> the same indentation-based
+    format it parses. Lists are written inline (`[a, b, c]`) rather than as
+    `- item` blocks -- parse_simple_yaml accepts both, and inline is simpler
+    to get right for the flat string/number lists this config actually has
+    (e.g. planner.terminal_actions). Round-trip-tested against the shipped
+    config.yaml in tests/test_regressions.py."""
+    pad = '  ' * indent
+    lines = []
+    for key, value in data.items():
+        if isinstance(value, dict):
+            lines.append(f'{pad}{key}:')
+            lines.append(dump_simple_yaml(value, indent + 1))
+        else:
+            lines.append(f'{pad}{key}: {dump_scalar(value)}')
+    return '\n'.join(lines)
 
 
 def main() -> None:

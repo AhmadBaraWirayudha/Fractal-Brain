@@ -1,5 +1,300 @@
 # Changelog
 
+## Adaptive hyperparameter optimizer merged in and wired to the real ecosystem
+
+`adaptive_optimizer.py` arrived as a complete, independently-authored, pure-stdlib
+hyperparameter optimization engine (2900+ lines: 21+ search strategies, a
+meta-controller, Bayesian belief tracking, GP-based acquisition, constraints,
+multi-objective scoring) whose own docstring says it "integrates natively into the
+Fractal Brain + Living Knowledge Graph ecosystem." Verified the library itself first,
+before any integration: a toy quadratic objective converged to within ~0.06 of the true
+optimum in 40 trials, and a hard-constraint scenario correctly rejected out-of-bounds
+proposals with the expected penalty score. "Incorporate for all files" meant making the
+dependency-injection points it ships with -- `LivingKnowledgeGraphInterface`,
+`FractalMemoryInterface` -- actually bridge to the real `lkg.py` graph and
+`fractal_brain` storage this codebase has, not its own standalone default
+implementations, plus a parameter registry and objective function scoped to what this
+pipeline actually has wired up. New file `pipeline_optimizer.py` holds all of that;
+`adaptive_optimizer.py` itself needed no changes -- see `docs/ADAPTIVE_OPTIMIZER.md`
+for the full design.
+
+**The adapters.** `LivingKnowledgeGraphInterface` requires `add_node`/`add_edge`/
+`record_trial`/`get_parameter_correlations`; `lkg.LivingKnowledgeGraph` has none of
+those (facts/entities/confidence, not nodes/edges/trials) -- passing it in directly
+would fail at the first call. Grepped the whole file to confirm `record_trial` is the
+only one of the four ever called internally (`add_node`/`add_edge`/
+`get_parameter_correlations` exist for external callers). `PipelineKnowledgeGraphAdapter`
+delegates the bookkeeping `adaptive_optimizer.py` actually needs to one of its own
+default `LivingKnowledgeGraph` instances (reused, not reimplemented), and separately
+pushes one real, repeatedly-observable fact per completed trial into the shared
+`lkg.py` graph: whether this optimization run is still improving on its own recent
+average. That specific design took a wrong turn first: `TrialResult` doesn't carry a
+search-strategy name, so the first idea (per-strategy reliability, mirroring
+`matched_intent`'s per-source tracking) wasn't available, and a naive per-trial-id fact
+would only ever get one observation each -- Beta confidence tracking can't build a
+signal from a subject it never sees twice. The aggregate "still improving" fact is
+observed repeatedly instead. A separate `OptimizerStateObserver` (registered via
+`add_observer()`, since state changes arrive through `OptimizationObserver`, a
+different interface) tracks the optimizer's own state progression as an
+`optimizer_state` entity -- the same `observe_entity_transition` mechanism `engine.py`
+uses for `session_intent`. First attempt at this crashed immediately
+(`KeyError: "Unknown entity: 'optimizer_state'"`): the entity has to be defined via
+`define_entity_states` before anything can observe a transition into it, and nothing
+was doing so. Fixed with the same idempotency discipline as `engine.py`'s
+`session_intent` guard, but using only the public API this time (`lkg.py` wasn't
+touched for this): `get_current_state_distribution`'s documented `KeyError` is the
+signal that an entity isn't defined yet, so `_ensure_optimizer_state_entity` checks
+that instead of reaching into private internals or adding a new method.
+`PipelineFractalMemoryAdapter` bridges elite/failed configuration storage to
+`fractal_brain.storage.Storage`'s generic key-value table, in a **dedicated db file**
+(new `paths.optimizer_db` in `config.yaml`): `Storage`'s own `documents` table schema
+collides column-for-column with `memory.VectorMemoryStore`'s, so sharing `data/
+engine.db` would corrupt whichever connects second.
+
+**The parameter registry is real, not aspirational.** `adaptive_optimizer.py` ships its
+own `populate_default_ecosystem_parameters()` with names like `decoder.temperature`,
+`controller.confidence_target`, `fractal_engine.recursion_budget` -- a plausible
+imagined ecosystem that doesn't match this rule-based, non-sampling generator (no
+temperature/top-p sampling exists anywhere in `moe_model.py`). Only
+`knowledge_graph.forgetting_factor` happens to match a real key exactly.
+`build_pipeline_parameter_registry()` registers 8 parameters instead, every one a
+dotted name mapping to an actual `config.yaml` key (`retrieval.top_k`, `model.
+retrieval_confidence_threshold`, `planner.n_states`, `planner.max_plan_steps`,
+`decomposition.max_subtasks`, and three `knowledge_graph.*` values) --
+`test_parameter_registry_matches_real_config_keys` checks every one still exists.
+
+**The objective function, and two real bugs found building it.**
+`UnifiedAIPipeline`/`OpenClosedLoopEngine` only accept a `config_path`, not a
+pre-parsed dict, so scoring a candidate configuration means writing it to a real temp
+file and constructing through the normal constructor -- which needed a YAML
+serializer, since none existed (`engine.dump_simple_yaml`, the inverse of
+`parse_simple_yaml`; round-trip-verified against the shipped `config.yaml` and against
+overridden values including a case that needed quoting, before being trusted).
+
+The first version of the objective scored mean reflection confidence minus a
+risk-count penalty -- both already-computed signals, reused rather than inventing a
+new metric. Running the *same* prompt at `retrieval_confidence_threshold=0.1` and
+`=0.99` and comparing scores directly showed them bit-identical. Traced to
+`ai_pipeline.py`'s own `run()` order: `FractalBrain.evaluate()` computes loss from the
+raw input tokens *before* the closed loop (which is what every registered parameter
+actually touches) runs at all, so reflection confidence -- derived from that loss --
+is mathematically independent of every one of the 8 registered parameters. Debugging
+that surfaced a second, compounding bug: a trial's temp config file lives in a
+throwaway temp directory, and `OpenClosedLoopEngine` resolves relative paths
+(`paths.bootstrap_dataset`) against its *own config file's* directory -- so every
+trial's memory corpus was silently empty (0 documents loaded) regardless of any
+setting, independently guaranteeing nothing could vary. Fixed both:
+`_resolve_paths_section` resolves `paths.*` to absolute against the real project
+directory before writing the temp config, and the objective now rewards the best
+retrieved document's cosine score when it clears the threshold (scaled by match
+quality) or a flat `-0.1` when it doesn't -- verified mechanically sensitive
+(permissive settings consistently outscore strict ones; regression tests
+`test_score_config_finds_bootstrap_data_from_a_temp_directory`,
+`test_score_config_is_sensitive_to_retrieval_threshold`).
+
+Stated plainly rather than glossed over: this objective is directly sensitive to
+`model.retrieval_confidence_threshold` (its entire branching condition) but only weakly
+or not at all to several other registered parameters in a single-shot, no-history
+trial -- confirmed empirically that `retrieval.top_k` produces identical scores across
+`top_k=1..8` here, since the reward reads only the single best-scoring match, not how
+many candidates were returned. Most `knowledge_graph.*` parameters govern behavior that
+accumulates over many turns, which one fresh pipeline instance per trial never has a
+chance to do. `AdaptiveOptimizer` still searches those dimensions safely -- a flat
+objective means no informative gradient there, not an error -- and a richer or
+multi-turn objective is a reasonable follow-up, not something claimed to already work.
+See `docs/ADAPTIVE_OPTIMIZER.md`.
+
+**Reachability.** New `--mode tune` in `hybrid_cli.py`
+(`python hybrid_cli.py --mode tune --trials 20`), so this is runnable, not just
+importable-but-dormant. End-to-end verified: a 25-trial `optimize()` run correctly
+found and recorded a state transition (`INITIALIZING` -> `EXPLORING`) in the real `lkg.py`
+graph, computed real Pearson correlations between registered parameters through the
+adapter, and persisted 5 elite configurations through `Storage` that a fresh adapter
+instance (same db file) could read back. Each trial costs roughly 5-6 seconds
+(builds a full pipeline including a `FractalBrain` instance); documented plainly in
+`docs/ADAPTIVE_OPTIMIZER.md` rather than left for a user to discover.
+
+## Generation now actually reads the knowledge graph, and two bugs found wiring that up
+
+The previous entry below ("Living Knowledge Graph merged in and wired into the closed
+loop") explicitly scoped the graph as observability-only -- updated every turn, never
+read by `decoder.py`. That scope note was accurate at the time; extending it to
+actually condition generation surfaced two real bugs, both found by testing the
+extension rather than assuming it worked.
+
+**Bug 1 -- `matched_intent` confidence had a per-document floor tied to its own
+retrieval score, worst for exactly the documents that mattered most.** The original
+design (previous entry) had `run()` record retrieval itself as positive evidence for
+a document's `matched_intent` fact, weighted by its cosine similarity score. Wiring
+generation to caveat low-confidence documents meant driving a document's confidence
+down with repeated negative feedback and checking it crossed the threshold. It
+plateaued at 0.433-0.437 and never went lower, no matter how many rounds of pure
+negative feedback ran. Traced it to the math: each cycle added `score` (~0.78 here) to
+the fact's positive pseudo-count (from retrieval, every single time) and `1.0` to its
+negative pseudo-count (from feedback, only when given), so the posterior mean has a
+hard floor at `score/(score+1)` as evidence accumulates -- for a near-perfect match
+(score near 1.0) that floor approaches 0.5, meaning the highest-confidence retrievals
+(exactly the ones `retrieval_confidence_threshold` trusts enough to surface verbatim,
+no plan-based fallback) are structurally the hardest to ever flag. Fixed by removing
+retrieval's own vote entirely: `matched_intent` confidence is now purely
+feedback-driven, set only by `close_loop()`. A document with no feedback yet reads as
+a neutral 0.5 (Beta(1,1) prior, confirmed directly against a fact with zero
+`add_fact` calls) rather than an inflated score. Regression coverage:
+`test_matched_intent_confidence_is_neutral_before_feedback`,
+`test_sustained_negative_feedback_has_no_retrieval_score_floor`
+(`tests/test_knowledge_graph_integration.py`).
+
+**Bug 2 -- the caveat text itself could get frozen into a future "solved example" and
+echoed back stale.** `close_loop()` already stores a successful interaction's full
+output as a new retrievable document (`source: successful_interaction`) -- pre-existing
+behavior, not part of this integration. Stress-testing the caveat (repeated
+negative feedback, then repeated positive feedback on the same query) surfaced that
+once a caveat-bearing answer got stored this way, later turns retrieving it echoed the
+caveat's *old* confidence number verbatim, regardless of what the document's real,
+live confidence had become by then -- confirmed by tracing the actual top-scoring
+document each round: its live confidence climbed from 0.5 to 0.90, while the caveat
+(with a stale "0.32") kept appearing in every subsequent output regardless. Fixed
+narrowly, scoped to only what this integration added: `moe_model.py` now defines
+`KG_CAVEAT_PREFIX` once, and `close_loop()` strips any line starting with it before
+using generated text as stored solution content, so the caveat can never outlive the
+confidence value it was reporting. Left alone: the broader pattern of the *entire*
+stored text (including this backend's own always-present preamble line, unrelated to
+the graph) being able to nest across repeated storage/retrieval cycles is a
+pre-existing property of that storage path, not something introduced here or fixed as
+part of it -- noted honestly in `docs/UNIFIED_PIPELINE.md` rather than silently
+patched over, since fixing it would mean redesigning `close_loop`'s success-storage
+logic, a separate and larger change. Regression coverage:
+`test_caveat_reflects_live_confidence_not_frozen_stored_text`.
+
+**What generation actually does with the signal, once both were fixed:**
+`SharedMoEBackbone` (`moe_model.py`) gained a `low_confidence_threshold` (new
+`knowledge_graph.low_confidence_threshold` config field, shared with
+`ai_pipeline.py`'s reflection heuristic so the two can't quietly drift apart -- the
+reflection's own hardcoded `0.4` was replaced with a read from the same field). When
+the best-scoring retrieved document clears `retrieval_confidence_threshold` and gets
+surfaced verbatim, and its live `matched_intent` confidence is below this threshold, a
+caution line is appended noting its track record. `decoder.py`'s `generate()` gained a
+`doc_confidence` parameter threading this through (and `structured_context['retrieved']`
+gained a `doc_id` field it was previously missing, needed to look confidence up per
+document); `engine.py`'s `run()` computes the knowledge-graph snapshot once, right
+after updating it, and reuses it both for this and for the result's own
+`knowledge_graph` field, rather than querying the graph twice.
+
+## Living Knowledge Graph merged in and wired into the closed loop
+
+`lkg.py` arrived as a complete, already-tested standalone module (`BetaDistribution`
+fact confidence, `DiscreteMarkovChain` entity-state tracking, a `ParticleFilter` doing
+whole-graph sequential Monte Carlo inference over both, wrapped as
+`LivingKnowledgeGraph`/`AdvancedLKG`) with no existing references anywhere in this
+codebase. "Merge it in" meant two things: making it part of the package properly, and
+actually wiring it into the pipeline rather than leaving it an unused file.
+
+**Packaging first, since it's easy to get wrong silently:** this project ships
+top-level modules via an explicit `py-modules` list in `pyproject.toml` rather than
+directory discovery, so a new root-level `.py` file doesn't get packaged just by
+existing next to the others. Added `"lkg"` to that list and confirmed with a real
+`python -m build --sdist` that it lands in the tarball (`tests/test_package_metadata.py`
+checks for scaffolding files but doesn't enumerate `py-modules`, so this wouldn't have
+been caught by the existing suite -- worth knowing if another module gets added the
+same way later). The module's own embedded `TestLivingKG(unittest.TestCase)` and
+`if __name__ == "__main__"` block moved to `tests/test_lkg.py` unchanged, since every
+other implementation file here keeps tests out of the shipped module.
+
+**One functional gap, found by actually trying to use it for something:** the plan was
+to track a session's sequence of task intents (`math_symbolic`/`coding`/`engineering`/
+`general`) as a tracked entity, predicting what a session is likely to ask about next.
+Wiring that up surfaced that `LivingKnowledgeGraph`'s public API had no way to do it.
+`DiscreteMarkovChain.observe_transition()` exists and is exactly what's needed, but
+grepping the whole file showed it was called only from the module's own tests --
+never from `ParticleFilter` or `LivingKnowledgeGraph`. Verified directly: defining
+entity states and then calling nothing but `step()` 25 times in a row left
+`predict_entity_state()` locked at a uniform distribution the entire time, because
+`predict()`'s sampling is self-loop-biased whenever a state has zero observed
+transitions -- which is forever, with no path to add any. Added
+`LivingKnowledgeGraph.observe_entity_transition(entity_id, to_state)`: for every
+particle, records the transition from that particle's currently-believed state to the
+now-known true state, then snaps the particle to it (the standard treatment for a
+fully-observed state variable in a particle filter/HMM). Re-ran the same 25-step
+experiment through `observe_entity_transition` instead of `step()` alone: predictions
+moved from uniform to correctly favoring the dominant observed pattern. Regression
+tests for both the gap and the fix: `test_step_alone_never_learns_a_pattern`,
+`test_observe_entity_transition_learns_a_pattern` (`tests/test_lkg.py`). Also added
+`from_config(config)`, matching the `from_config` idiom every other `engine.py`
+component already uses (`VectorMemoryStore`, `TaskDecomposer`, `MarkovChainPlanner`,
+...) -- neither method existed in the original standalone file.
+
+**Wiring, in `engine.py`/`ai_pipeline.py`:** `OpenClosedLoopEngine` now owns one
+`LivingKnowledgeGraph` (config: new `knowledge_graph:` section in `config.yaml`).
+`decomposer.py` gained a public `KNOWN_INTENTS` tuple (previously the four intent
+strings only existed as literals inside `decompose()`'s if/elif branches) so the
+entity's state set has one source of truth instead of a second hardcoded copy in
+`engine.py`. Each `run()` call now records this turn's intent as an observed
+`session_intent` transition and, for every retrieved document, a `matched_intent` fact
+weighted by that document's retrieval score and attributed to its origin --
+`bootstrap`, `pipeline_feedback`, or `successful_interaction` (bootstrap records don't
+carry an explicit `metadata['source']`, only a boolean `bootstrap` flag, so
+`engine._document_source()` normalizes both into one label space). `close_loop()`
+reinforces or penalizes those same facts once real feedback is known
+(`positive=success`, not just always-positive), so a source's tracked reliability
+reflects actual downstream outcomes, not just how often its documents get retrieved.
+A `_kg_entities_defined` guard keeps repeated `initialize()` calls from wiping this
+history: `define_entity_states()` unconditionally builds fresh Markov chains, and
+`initialize()` is deliberately called more than once against the same engine
+elsewhere (`test_bootstrap_is_idempotent`) -- confirmed the guard holds across a
+double re-initialize with `test_knowledge_graph_survives_repeated_initialize`.
+
+The engine's `run()` result gained a `knowledge_graph` field (predicted next intent +
+distribution, per-document confidence); `ai_pipeline.py` folds it into
+`cognitive_context`, adds two reflection risk heuristics (a topic-shift note when the
+session's tracked history disagrees with this turn's actual intent, a low-confidence
+note when retrieved documents have historically weak knowledge-graph confidence for
+this intent), and adds a `knowledge_graph` pipeline trace stage between `decompose`
+and `plan` (matching `engine.py`'s actual execution order). Verified end-to-end with a
+real two-turn session (`math_symbolic` then `general`): the reflection correctly
+flagged the topic shift, and the trace/cognitive_context carried the graph's state
+through to the top-level result exactly as `test_hybrid_cli_pipeline_mode_runs` and
+`test_session_pipeline_tracks_reflection` already exercise it via subprocess/direct
+calls -- neither needed changes since both read result dicts by key, not by exhaustive
+shape, but new coverage for the integration itself lives in
+`tests/test_knowledge_graph_integration.py`.
+
+Scope note: the knowledge graph is an observability/reflection-layer addition, the
+same relationship `FractalBrain` already has to the closed loop -- it doesn't feed
+into `decoder.py`'s generation itself. Extending generation to condition on it is a
+reasonable next step but a materially different (and separately reviewable) change
+from merging the module in and making its existing capabilities actually work.
+
+## Two bugs a real Windows run surfaced (both fixed)
+
+Everything up to this point had only been run and verified on Linux. Running it
+for real on Windows immediately surfaced two issues neither the review above nor
+CI (which runs on `ubuntu-latest`) would ever catch:
+
+- **`tests/test_smoke.py` hardcoded `/tmp/_test_tokenizer_vocab.json`** for a
+  BPE tokenizer save/load round-trip. `/tmp` doesn't exist on Windows, so this
+  crashed the whole smoke script with a `FileNotFoundError` partway through
+  (after the 130+ checks before it had already run and passed). Fixed using
+  the same `tempfile.mkdtemp()` pattern the file already uses correctly a bit
+  further down, for its checkpoint save/load test. Added
+  `test_no_hardcoded_unix_temp_paths` to `tests/test_regressions.py`, which
+  scans the whole source tree for hardcoded `/tmp`, `/var`, `/home`, `/etc`,
+  `/usr` absolute paths -- confirmed it fails on the original bug and passes
+  on the fix, so this class of bug can't reappear anywhere else unnoticed.
+
+- **`python -m pytest` failed with "No module named pytest"** on a fresh
+  Windows Python install. Expected in the sense that pytest is a test-only
+  dependency this project never installs for you (consistent with
+  `requirements.txt`'s "zero external dependencies" for the *runtime*), but
+  `run_demo.bat` and `demo_showcase.py --run-tests` are supposed to be
+  one-click -- making pytest a silent manual prerequisite defeated that. Added
+  `run_tests.py`, a small shared helper that checks for pytest, installs it
+  automatically via `pip install pytest` if missing (printing what it's
+  doing), and then runs both halves of the suite (the standalone smoke
+  script, then pytest) -- matching `.github/workflows/ci.yml`'s two steps
+  exactly. `demo_showcase.py`'s `--run-tests` and `run_demo.bat`'s "run tests"
+  options both now delegate to this one script instead of each duplicating
+  their own pytest invocation.
+
 ## Full-codebase review of the v3 unification layer: five bugs fixed, testing/docs/CI gaps closed
 
 Requested review of `hybrid_ai_pipeline_unified_v3` covering both correctness ("what's

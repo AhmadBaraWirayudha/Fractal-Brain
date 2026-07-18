@@ -238,6 +238,7 @@ class UnifiedAIPipeline:
             'retrieved_docs': len(closed_loop_result.get('retrieved', [])),
             'intent': closed_loop_result.get('intent'),
             'subtasks': closed_loop_result.get('subtasks', []),
+            'knowledge_graph': closed_loop_result.get('knowledge_graph', {}),
         }
 
     def _build_reflection(
@@ -275,6 +276,24 @@ class UnifiedAIPipeline:
 
         if feedback and not bool(feedback.get('success', False)):
             risks.append('Recent feedback indicates the previous answer should be improved.')
+
+        kg_info = closed_loop_result.get('knowledge_graph', {})
+        predicted_next_intent = kg_info.get('predicted_next_intent')
+        turn_count = cognitive_context.get('session', {}).get('turn_count', 0)
+        if predicted_next_intent and turn_count and predicted_next_intent != intent:
+            risks.append(
+                f"Session history pointed toward '{predicted_next_intent}', but this turn is "
+                f"'{intent}' -- possible topic shift the plan/generation may not be tuned for."
+            )
+        low_conf_threshold = float(self.closed_loop.config.get('knowledge_graph', {}).get('low_confidence_threshold', 0.4))
+        low_confidence_docs = [
+            d for d in kg_info.get('retrieved_doc_confidence', []) if d.get('mean', 1.0) < low_conf_threshold
+        ]
+        if low_confidence_docs:
+            risks.append(
+                f"{len(low_confidence_docs)} retrieved document(s) have historically low "
+                f"knowledge-graph confidence for this intent."
+            )
 
         should_train = bool(feedback and feedback.get('success', False)) or confidence < 0.45
         if should_train:
@@ -321,6 +340,11 @@ class UnifiedAIPipeline:
                     'intent': closed_loop_result.get('intent'),
                     'subtasks': closed_loop_result.get('subtasks', []),
                 },
+            ),
+            PipelineStageTrace(
+                name='knowledge_graph',
+                summary='Update the living knowledge graph with this turn\'s session intent and retrieval evidence.',
+                data=closed_loop_result.get('knowledge_graph', {}),
             ),
             PipelineStageTrace(
                 name='plan',
